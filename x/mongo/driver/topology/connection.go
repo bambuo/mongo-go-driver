@@ -51,11 +51,13 @@ type connection struct {
 	connectContextMade   chan struct{}
 	canStream            bool
 	currentlyStreaming   bool
+	connectContextMutex  sync.Mutex
 
 	// pool related fields
-	pool       *pool
-	poolID     uint64
-	generation uint64
+	pool         *pool
+	poolID       uint64
+	generation   uint64
+	expireReason string
 }
 
 // newConnection handles the creation of a connection. It does not connect the connection.
@@ -108,7 +110,23 @@ func (c *connection) connect(ctx context.Context) {
 	}
 	defer close(c.connectDone)
 
+	c.connectContextMutex.Lock()
 	ctx, c.cancelConnectContext = context.WithCancel(ctx)
+	c.connectContextMutex.Unlock()
+
+	defer func() {
+		var cancelFn context.CancelFunc
+
+		c.connectContextMutex.Lock()
+		cancelFn = c.cancelConnectContext
+		c.cancelConnectContext = nil
+		c.connectContextMutex.Unlock()
+
+		if cancelFn != nil {
+			cancelFn()
+		}
+	}()
+
 	close(c.connectContextMade)
 
 	// Assign the result of DialContext to a temporary net.Conn to ensure that c.nc is not set in an error case.
@@ -195,7 +213,16 @@ func (c *connection) wait() error {
 
 func (c *connection) closeConnectContext() {
 	<-c.connectContextMade
-	c.cancelConnectContext()
+	var cancelFn context.CancelFunc
+
+	c.connectContextMutex.Lock()
+	cancelFn = c.cancelConnectContext
+	c.cancelConnectContext = nil
+	c.connectContextMutex.Unlock()
+
+	if cancelFn != nil {
+		cancelFn()
+	}
 }
 
 func transformNetworkError(originalError error, contextDeadlineUsed bool) error {
@@ -339,7 +366,11 @@ func (c *connection) close() error {
 	return err
 }
 
-func (c *connection) expired() bool {
+func (c *connection) closed() bool {
+	return atomic.LoadInt32(&c.connected) == disconnected
+}
+
+func (c *connection) idleTimeoutExpired() bool {
 	now := time.Now()
 	if c.idleTimeout > 0 {
 		idleDeadline, ok := c.idleDeadline.Load().(time.Time)
@@ -351,8 +382,7 @@ func (c *connection) expired() bool {
 	if !c.lifetimeDeadline.IsZero() && now.After(c.lifetimeDeadline) {
 		return true
 	}
-
-	return atomic.LoadInt32(&c.connected) == disconnected
+	return false
 }
 
 func (c *connection) bumpIdleDeadline() {
