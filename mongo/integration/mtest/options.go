@@ -7,6 +7,9 @@
 package mtest
 
 import (
+	"errors"
+	"fmt"
+
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -16,9 +19,13 @@ type TopologyKind string
 
 // These constants specify valid values for TopologyKind
 const (
-	ReplicaSet TopologyKind = "replicaset"
-	Sharded                 = "sharded"
-	Single                  = "single"
+	ReplicaSet   TopologyKind = "replicaset"
+	Sharded      TopologyKind = "sharded"
+	Single       TopologyKind = "single"
+	LoadBalanced TopologyKind = "load-balanced"
+	// ShardedReplicaSet is a special case of sharded that requires each shard to be a replica set rather than a
+	// standalone server.
+	ShardedReplicaSet TopologyKind = "sharded-replicaset"
 )
 
 // ClientType specifies the type of Client that should be created for a test.
@@ -44,9 +51,48 @@ var (
 
 // RunOnBlock describes a constraint for a test.
 type RunOnBlock struct {
-	MinServerVersion string         `bson:"minServerVersion"`
-	MaxServerVersion string         `bson:"maxServerVersion"`
-	Topology         []TopologyKind `bson:"topology"`
+	MinServerVersion string                   `bson:"minServerVersion"`
+	MaxServerVersion string                   `bson:"maxServerVersion"`
+	Topology         []TopologyKind           `bson:"topology"`
+	ServerParameters map[string]bson.RawValue `bson:"serverParameters"`
+	Auth             *bool                    `bson:"auth"`
+}
+
+// UnmarshalBSON implements custom BSON unmarshalling behavior for RunOnBlock because some test formats use the
+// "topology" key while the unified test format uses "topologies".
+func (r *RunOnBlock) UnmarshalBSON(data []byte) error {
+	var temp struct {
+		MinServerVersion string                   `bson:"minServerVersion"`
+		MaxServerVersion string                   `bson:"maxServerVersion"`
+		Topology         []TopologyKind           `bson:"topology"`
+		Topologies       []TopologyKind           `bson:"topologies"`
+		ServerParameters map[string]bson.RawValue `bson:"serverParameters"`
+		Auth             *bool                    `bson:"auth"`
+		Extra            map[string]interface{}   `bson:",inline"`
+	}
+	if err := bson.Unmarshal(data, &temp); err != nil {
+		return fmt.Errorf("error unmarshalling to temporary RunOnBlock object: %v", err)
+	}
+	if len(temp.Extra) > 0 {
+		return fmt.Errorf("unrecognized fields for RunOnBlock: %v", temp.Extra)
+	}
+
+	r.MinServerVersion = temp.MinServerVersion
+	r.MaxServerVersion = temp.MaxServerVersion
+	r.ServerParameters = temp.ServerParameters
+	r.Auth = temp.Auth
+
+	if temp.Topology != nil {
+		r.Topology = temp.Topology
+	}
+	if temp.Topologies != nil {
+		if r.Topology != nil {
+			return errors.New("both 'topology' and 'topologies' keys cannot be specified for a RunOnBlock")
+		}
+
+		r.Topology = temp.Topologies
+	}
+	return nil
 }
 
 // optionFunc is a function type that configures a T instance.
@@ -209,6 +255,22 @@ func (op *Options) SSL(ssl bool) *Options {
 func (op *Options) Enterprise(ent bool) *Options {
 	op.optFuncs = append(op.optFuncs, func(t *T) {
 		t.enterprise = &ent
+	})
+	return op
+}
+
+// AtlasDataLake specifies whether this test should only be run against Atlas Data Lake servers. Defaults to false.
+func (op *Options) AtlasDataLake(adl bool) *Options {
+	op.optFuncs = append(op.optFuncs, func(t *T) {
+		t.dataLake = &adl
+	})
+	return op
+}
+
+// RequireAPIVersion specifies whether this test should only be run when REQUIRE_API_VERSION is true. Defaults to false.
+func (op *Options) RequireAPIVersion(rav bool) *Options {
+	op.optFuncs = append(op.optFuncs, func(t *T) {
+		t.requireAPIVersion = &rav
 	})
 	return op
 }

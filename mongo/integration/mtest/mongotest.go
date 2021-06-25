@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -20,7 +21,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/readconcern"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 	"go.mongodb.org/mongo-driver/mongo/writeconcern"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
+	"go.mongodb.org/mongo-driver/x/mongo/driver"
 )
 
 var (
@@ -83,23 +84,25 @@ type T struct {
 	*testing.T
 
 	// members for only this T instance
-	createClient     *bool
-	createCollection *bool
-	runOn            []RunOnBlock
-	mockDeployment   *mockDeployment // nil if the test is not being run against a mock
-	mockResponses    []bson.D
-	createdColls     []*Collection // collections created in this test
-	proxyDialer      *proxyDialer
-	dbName, collName string
-	failPointNames   []string
-	minServerVersion string
-	maxServerVersion string
-	validTopologies  []TopologyKind
-	auth             *bool
-	enterprise       *bool
-	ssl              *bool
-	collCreateOpts   bson.D
-	connsCheckedOut  int // net number of connections checked out during test execution
+	createClient      *bool
+	createCollection  *bool
+	runOn             []RunOnBlock
+	mockDeployment    *mockDeployment // nil if the test is not being run against a mock
+	mockResponses     []bson.D
+	createdColls      []*Collection // collections created in this test
+	proxyDialer       *proxyDialer
+	dbName, collName  string
+	failPointNames    []string
+	minServerVersion  string
+	maxServerVersion  string
+	validTopologies   []TopologyKind
+	auth              *bool
+	enterprise        *bool
+	dataLake          *bool
+	ssl               *bool
+	collCreateOpts    bson.D
+	connsCheckedOut   int // net number of connections checked out during test execution
+	requireAPIVersion *bool
 
 	// options copied to sub-tests
 	clientType  ClientType
@@ -110,9 +113,10 @@ type T struct {
 	baseOpts *Options // used to create subtests
 
 	// command monitoring channels
-	started   []*event.CommandStartedEvent
-	succeeded []*event.CommandSucceededEvent
-	failed    []*event.CommandFailedEvent
+	monitorLock sync.Mutex
+	started     []*event.CommandStartedEvent
+	succeeded   []*event.CommandSucceededEvent
+	failed      []*event.CommandFailedEvent
 
 	Client *mongo.Client
 	DB     *mongo.Database
@@ -129,8 +133,8 @@ func newT(wrapped *testing.T, opts ...*Options) *T {
 		}
 	}
 
-	if t.shouldSkip() {
-		t.Skip("no matching environmental constraint found")
+	if err := t.verifyConstraints(); err != nil {
+		t.Skipf("skipping due to environmental constraints: %v", err)
 	}
 
 	if t.collName == "" {
@@ -352,7 +356,12 @@ func (t *T) GetProxiedMessages() []*ProxyMessage {
 	if t.proxyDialer == nil {
 		return nil
 	}
-	return t.proxyDialer.messages
+	return t.proxyDialer.Messages()
+}
+
+// NumberConnectionsCheckedOut returns the number of connections checked out from the test Client.
+func (t *T) NumberConnectionsCheckedOut() int {
+	return t.connsCheckedOut
 }
 
 // ClearEvents clears the existing command monitoring events.
@@ -440,8 +449,11 @@ func (t *T) CreateCollection(coll Collection, createOnServer bool) *mongo.Collec
 
 // ClearCollections drops all collections previously created by this test.
 func (t *T) ClearCollections() {
-	for _, coll := range t.createdColls {
-		_ = coll.created.Drop(Background)
+	// Collections should not be dropped when testing against Atlas Data Lake because the data is pre-inserted.
+	if !testContext.dataLake {
+		for _, coll := range t.createdColls {
+			_ = coll.created.Drop(Background)
+		}
 	}
 	t.createdColls = t.createdColls[:0]
 }
@@ -468,11 +480,23 @@ func (t *T) SetFailPoint(fp FailPoint) {
 		}
 	}
 
-	admin := t.Client.Database("admin")
-	if err := admin.RunCommand(Background, fp).Err(); err != nil {
-		t.Fatalf("error creating fail point on server: %v", err)
+	if err := SetFailPoint(fp, t.Client); err != nil {
+		t.Fatal(err)
 	}
 	t.failPointNames = append(t.failPointNames, fp.ConfigureFailPoint)
+}
+
+// SetFailPointFromDocument sets the fail point represented by the given document for the client associated with T. This
+// method assumes that the given document is in the form {configureFailPoint: <failPointName>, ...}. Commands to create
+// the failpoint will appear in command monitoring channels. The fail point will be automatically disabled after this
+// test has run.
+func (t *T) SetFailPointFromDocument(fp bson.Raw) {
+	if err := SetRawFailPoint(fp, t.Client); err != nil {
+		t.Fatal(err)
+	}
+
+	name := fp.Index(0).Value().StringValue()
+	t.failPointNames = append(t.failPointNames, name)
 }
 
 // TrackFailPoint adds the given fail point to the list of fail points to be disabled when the current test finishes.
@@ -497,26 +521,6 @@ func (t *T) ClearFailPoints() {
 	t.failPointNames = t.failPointNames[:0]
 }
 
-// AuthEnabled returns whether or not this test is running in an environment with auth.
-func (t *T) AuthEnabled() bool {
-	return testContext.authEnabled
-}
-
-// SSLEnabled returns whether or not this test is running in an environment with SSL.
-func (t *T) SSLEnabled() bool {
-	return testContext.sslEnabled
-}
-
-// TopologyKind returns the topology kind of the environment
-func (t *T) TopologyKind() TopologyKind {
-	return testContext.topoKind
-}
-
-// ConnString returns the connection string used to create the client for this test.
-func (t *T) ConnString() string {
-	return testContext.connString.Original
-}
-
 // CloneDatabase modifies the default database for this test to match the given options.
 func (t *T) CloneDatabase(opts *options.DatabaseOptions) {
 	t.DB = t.Client.Database(t.dbName, opts)
@@ -527,17 +531,6 @@ func (t *T) CloneCollection(opts *options.CollectionOptions) {
 	var err error
 	t.Coll, err = t.Coll.Clone(opts)
 	assert.Nil(t, err, "error cloning collection: %v", err)
-}
-
-// GlobalClient returns a client configured with read concern majority, write concern majority, and read preference
-// primary. The returned client is not tied to the receiver and is valid outside the lifetime of the receiver.
-func (T) GlobalClient() *mongo.Client {
-	return testContext.client
-}
-
-// GlobalTopology returns the Topology backing the global Client.
-func (T) GlobalTopology() *topology.Topology {
-	return testContext.topo
 }
 
 func sanitizeCollectionName(db string, coll string) string {
@@ -559,15 +552,25 @@ func (t *T) createTestClient() {
 		// default opts
 		clientOpts = options.Client().SetWriteConcern(MajorityWc).SetReadPreference(PrimaryRp)
 	}
+	// set ServerAPIOptions to latest version if required
+	if clientOpts.Deployment == nil && t.clientType != Mock && clientOpts.ServerAPIOptions == nil && testContext.requireAPIVersion {
+		clientOpts.SetServerAPIOptions(options.ServerAPI(driver.TestServerAPIVersion))
+	}
 	// command monitor
 	clientOpts.SetMonitor(&event.CommandMonitor{
 		Started: func(_ context.Context, cse *event.CommandStartedEvent) {
+			t.monitorLock.Lock()
+			defer t.monitorLock.Unlock()
 			t.started = append(t.started, cse)
 		},
 		Succeeded: func(_ context.Context, cse *event.CommandSucceededEvent) {
+			t.monitorLock.Lock()
+			defer t.monitorLock.Unlock()
 			t.succeeded = append(t.succeeded, cse)
 		},
 		Failed: func(_ context.Context, cfe *event.CommandFailedEvent) {
+			t.monitorLock.Lock()
+			defer t.monitorLock.Unlock()
 			t.failed = append(t.failed, cfe)
 		},
 	})
@@ -635,7 +638,9 @@ func (t *T) createTestCollection() {
 	t.DB = t.Client.Database(t.dbName)
 	t.createdColls = t.createdColls[:0]
 
-	createOnServer := t.createCollection == nil || *t.createCollection
+	// Collections should not be explicitly created when testing against Atlas Data Lake because they already exist in
+	// the server with pre-seeded data.
+	createOnServer := (t.createCollection == nil || *t.createCollection) && !testContext.dataLake
 	t.Coll = t.CreateCollection(Collection{
 		Name:       t.collName,
 		CreateOpts: t.collCreateOpts,
@@ -643,68 +648,116 @@ func (t *T) createTestCollection() {
 	}, createOnServer)
 }
 
-// matchesServerVersion checks if the current server version is in the range [min, max]. Server versions will only be
-// compared if they are non-empty.
-func matchesServerVersion(min, max string) bool {
-	if min != "" && compareVersions(testContext.serverVersion, min) < 0 {
-		return false
+// verifyVersionConstraints returns an error if the cluster's server version is not in the range [min, max]. Server
+// versions will only be checked if they are non-empty.
+func verifyVersionConstraints(min, max string) error {
+	if min != "" && CompareServerVersions(testContext.serverVersion, min) < 0 {
+		return fmt.Errorf("server version %q is lower than min required version %q", testContext.serverVersion, min)
 	}
-	return max == "" || compareVersions(testContext.serverVersion, max) <= 0
+	if max != "" && CompareServerVersions(testContext.serverVersion, max) > 0 {
+		return fmt.Errorf("server version %q is higher than max version %q", testContext.serverVersion, max)
+	}
+	return nil
 }
 
-// matchesTopology checks if the current topology is present in topologies.
-// if topologies is empty, true is returned without any additional checks.
-func matchesTopology(topologies []TopologyKind) bool {
+// verifyTopologyConstraints returns an error if the cluster's topology kind does not match one of the provided
+// kinds. If the topologies slice is empty, nil is returned without any additional checks.
+func verifyTopologyConstraints(topologies []TopologyKind) error {
 	if len(topologies) == 0 {
-		return true
+		return nil
 	}
 
 	for _, topo := range topologies {
-		if topo == testContext.topoKind {
-			return true
+		// For ShardedReplicaSet, we won't get an exact match because testContext.topoKind will be Sharded so we do an
+		// additional comparison with the testContext.shardedReplicaSet field.
+		if topo == testContext.topoKind || (topo == ShardedReplicaSet && testContext.shardedReplicaSet) {
+			return nil
 		}
 	}
-	return false
+	return fmt.Errorf("topology kind %q does not match any of the required kinds %q", testContext.topoKind, topologies)
 }
 
-// matchesRunOnBlock returns true if the current environmental constraints match the given RunOnBlock.
-func matchesRunOnBlock(rob RunOnBlock) bool {
-	if !matchesServerVersion(rob.MinServerVersion, rob.MaxServerVersion) {
-		return false
+func verifyServerParametersConstraints(serverParameters map[string]bson.RawValue) error {
+	for param, expected := range serverParameters {
+		actual, err := testContext.serverParameters.LookupErr(param)
+		if err != nil {
+			return fmt.Errorf("server does not support parameter %q", param)
+		}
+		if !expected.Equal(actual) {
+			return fmt.Errorf("mismatched values for server parameter %q; expected %s, got %s", param, expected, actual)
+		}
 	}
-	return matchesTopology(rob.Topology)
+	return nil
 }
 
-func (t *T) shouldSkip() bool {
+func verifyAuthConstraint(expected *bool) error {
+	if expected != nil && *expected != testContext.authEnabled {
+		return fmt.Errorf("test requires auth value: %v, cluster auth value: %v", *expected, testContext.authEnabled)
+	}
+	return nil
+}
+
+// verifyRunOnBlockConstraint returns an error if the current environment does not match the provided RunOnBlock.
+func verifyRunOnBlockConstraint(rob RunOnBlock) error {
+	if err := verifyVersionConstraints(rob.MinServerVersion, rob.MaxServerVersion); err != nil {
+		return err
+	}
+	if err := verifyTopologyConstraints(rob.Topology); err != nil {
+		return err
+	}
+	if err := verifyAuthConstraint(rob.Auth); err != nil {
+		return err
+	}
+
+	return verifyServerParametersConstraints(rob.ServerParameters)
+}
+
+// verifyConstraints returns an error if the current environment does not match the constraints specified for the test.
+func (t *T) verifyConstraints() error {
 	// Check constraints not specified as runOn blocks
-	if !matchesServerVersion(t.minServerVersion, t.maxServerVersion) {
-		return true
+	if err := verifyVersionConstraints(t.minServerVersion, t.maxServerVersion); err != nil {
+		return err
 	}
-	if !matchesTopology(t.validTopologies) {
-		return true
+	if err := verifyTopologyConstraints(t.validTopologies); err != nil {
+		return err
 	}
-	if t.auth != nil && *t.auth != testContext.authEnabled {
-		return true
+	if err := verifyAuthConstraint(t.auth); err != nil {
+		return err
 	}
 	if t.ssl != nil && *t.ssl != testContext.sslEnabled {
-		return true
+		return fmt.Errorf("test requires ssl value: %v, cluster ssl value: %v", *t.ssl, testContext.sslEnabled)
 	}
 	if t.enterprise != nil && *t.enterprise != testContext.enterpriseServer {
-		return true
+		return fmt.Errorf("test requires enterprise value: %v, cluster enterprise value: %v", *t.enterprise,
+			testContext.enterpriseServer)
+	}
+	if t.dataLake != nil && *t.dataLake != testContext.dataLake {
+		return fmt.Errorf("test requires cluster to be data lake: %v, cluster is data lake: %v", *t.dataLake,
+			testContext.dataLake)
+	}
+	if t.requireAPIVersion != nil && *t.requireAPIVersion != testContext.requireAPIVersion {
+		return fmt.Errorf("test requires RequireAPIVersion value: %v, local RequireAPIVersion value: %v", *t.requireAPIVersion,
+			testContext.requireAPIVersion)
 	}
 
-	// Check runOn blocks
-	// The test can be executed if there are no blocks or at least block matches the current test setup.
+	// Check runOn blocks. The test can be executed if there are no blocks or at least block matches the current test
+	// setup.
 	if len(t.runOn) == 0 {
-		return false
+		return nil
 	}
+
+	// Stop once we find a RunOnBlock that matches the current environment. Record all errors as we go because if we
+	// don't find any matching blocks, we want to report the comparison errors for each block.
+	var runOnErrors []error
 	for _, runOn := range t.runOn {
-		if matchesRunOnBlock(runOn) {
-			return false
+		err := verifyRunOnBlockConstraint(runOn)
+		if err == nil {
+			return nil
 		}
+
+		runOnErrors = append(runOnErrors, err)
 	}
-	// no matching block found
-	return true
+	return fmt.Errorf("no matching RunOnBlock; comparison errors: %v", runOnErrors)
 }
 
 func (t *T) interfaceToInt32(i interface{}) (int32, error) {

@@ -11,12 +11,12 @@ import (
 	"go.mongodb.org/mongo-driver/bson/bsontype"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/internal/testutil/assert"
+	"go.mongodb.org/mongo-driver/mongo/address"
+	"go.mongodb.org/mongo-driver/mongo/description"
 	"go.mongodb.org/mongo-driver/mongo/readconcern"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 	"go.mongodb.org/mongo-driver/mongo/writeconcern"
 	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/address"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/session"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/uuid"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/wiremessage"
@@ -129,7 +129,8 @@ func TestOperation(t *testing.T) {
 		noerr(t, err)
 		err = sessInProgressTransaction.StartTransaction(nil)
 		noerr(t, err)
-		sessInProgressTransaction.ApplyCommand(description.Server{})
+		err = sessInProgressTransaction.ApplyCommand(description.Server{})
+		noerr(t, err)
 
 		wcAck := writeconcern.New(writeconcern.WMajority())
 		wcUnack := writeconcern.New(writeconcern.W(0))

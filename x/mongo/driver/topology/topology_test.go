@@ -9,15 +9,16 @@ package topology
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"go.mongodb.org/mongo-driver/internal/testutil/assert"
+	"go.mongodb.org/mongo-driver/mongo/address"
+	"go.mongodb.org/mongo-driver/mongo/description"
 	"go.mongodb.org/mongo-driver/x/mongo/driver"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/address"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/connstring"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
 )
 
 const testTimeout = 2 * time.Second
@@ -83,6 +84,54 @@ func TestServerSelection(t *testing.T) {
 		if srvs[0].Addr != desc.Servers[0].Addr {
 			t.Errorf("Incorrect sever selected. got %s; want %s", srvs[0].Addr, desc.Servers[0].Addr)
 		}
+	})
+	t.Run("Compatibility Error Min Version Too High", func(t *testing.T) {
+		topo, err := New()
+		noerr(t, err)
+		desc := description.Topology{
+			Kind: description.Single,
+			Servers: []description.Server{
+				{Addr: address.Address("one:27017"), Kind: description.Standalone, WireVersion: &description.VersionRange{Max: 11, Min: 11}},
+				{Addr: address.Address("two:27017"), Kind: description.Standalone, WireVersion: &description.VersionRange{Max: 9, Min: 2}},
+				{Addr: address.Address("three:27017"), Kind: description.Standalone, WireVersion: &description.VersionRange{Max: 9, Min: 2}},
+			},
+		}
+		want := fmt.Errorf(
+			"server at %s requires wire version %d, but this version of the Go driver only supports up to %d",
+			desc.Servers[0].Addr.String(),
+			desc.Servers[0].WireVersion.Min,
+			SupportedWireVersions.Max,
+		)
+		desc.CompatibilityErr = want
+		atomic.StoreInt32(&topo.connectionstate, connected)
+		topo.desc.Store(desc)
+		_, err = topo.SelectServer(context.Background(), selectFirst)
+		assert.Equal(t, err, want, "expected %v, got %v", want, err)
+	})
+	t.Run("Compatibility Error Max Version Too Low", func(t *testing.T) {
+		topo, err := New()
+		noerr(t, err)
+		desc := description.Topology{
+			Kind: description.Single,
+			Servers: []description.Server{
+				{Addr: address.Address("one:27017"), Kind: description.Standalone, WireVersion: &description.VersionRange{Max: 1, Min: 1}},
+				{Addr: address.Address("two:27017"), Kind: description.Standalone, WireVersion: &description.VersionRange{Max: 9, Min: 2}},
+				{Addr: address.Address("three:27017"), Kind: description.Standalone, WireVersion: &description.VersionRange{Max: 9, Min: 2}},
+			},
+		}
+		want := fmt.Errorf(
+			"server at %s reports wire version %d, but this version of the Go driver requires "+
+				"at least %d (MongoDB %s)",
+			desc.Servers[0].Addr.String(),
+			desc.Servers[0].WireVersion.Max,
+			SupportedWireVersions.Min,
+			MinSupportedMongoDBVersion,
+		)
+		desc.CompatibilityErr = want
+		atomic.StoreInt32(&topo.connectionstate, connected)
+		topo.desc.Store(desc)
+		_, err = topo.SelectServer(context.Background(), selectFirst)
+		assert.Equal(t, err, want, "expected %v, got %v", want, err)
 	})
 	t.Run("Updated", func(t *testing.T) {
 		topo, err := New()
@@ -160,9 +209,8 @@ func TestServerSelection(t *testing.T) {
 			t.Errorf("Timed out while trying to retrieve selected servers")
 		}
 
-		if err != context.Canceled {
-			t.Errorf("Incorrect error received. got %v; want %v", err, context.Canceled)
-		}
+		want := ServerSelectionError{Wrapped: context.Canceled, Desc: desc}
+		assert.Equal(t, err, want, "Incorrect error received. got %v; want %v", err, want)
 	})
 	t.Run("Timeout", func(t *testing.T) {
 		desc := description.Topology{
@@ -234,7 +282,7 @@ func TestServerSelection(t *testing.T) {
 		topo, err := New()
 		noerr(t, err)
 		atomic.StoreInt32(&topo.connectionstate, connected)
-		srvr, err := ConnectServer(address.Address("one"), topo.updateCallback)
+		srvr, err := ConnectServer(address.Address("one"), topo.updateCallback, topo.id)
 		noerr(t, err)
 		topo.servers[address.Address("one")] = srvr
 		desc := topo.desc.Load().(description.Topology)
@@ -268,7 +316,7 @@ func TestServerSelection(t *testing.T) {
 
 		// manually add the servers to the topology
 		for _, srv := range desc.Servers {
-			s, err := ConnectServer(srv.Addr, topo.updateCallback)
+			s, err := ConnectServer(srv.Addr, topo.updateCallback, topo.id)
 			noerr(t, err)
 			topo.servers[srv.Addr] = s
 		}
@@ -289,7 +337,7 @@ func TestServerSelection(t *testing.T) {
 		serv, err := topo.FindServer(desc.Servers[0])
 		noerr(t, err)
 		atomic.StoreInt32(&serv.connectionstate, connected)
-		serv.ProcessError(driver.Error{Message: "not master"}, initConnection{})
+		_ = serv.ProcessError(driver.Error{Message: "not master"}, initConnection{})
 
 		resp := make(chan []description.Server)
 
@@ -330,7 +378,7 @@ func TestServerSelection(t *testing.T) {
 		}
 		topo.desc.Store(desc)
 		for _, srv := range desc.Servers {
-			s, err := ConnectServer(srv.Addr, topo.updateCallback)
+			s, err := ConnectServer(srv.Addr, topo.updateCallback, topo.id)
 			noerr(t, err)
 			topo.servers[srv.Addr] = s
 		}

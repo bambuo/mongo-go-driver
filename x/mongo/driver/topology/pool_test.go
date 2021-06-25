@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/internal/testutil/assert"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/address"
+	"go.mongodb.org/mongo-driver/mongo/address"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/operation"
 )
 
@@ -216,7 +216,7 @@ func TestPool(t *testing.T) {
 			disconnectDone := make(chan struct{})
 			_, err = p.get(context.Background())
 			noerr(t, err)
-			getCtx, getCancel := context.WithCancel(context.Background())
+			getCtx, getCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer getCancel()
 			go func() {
 				defer close(getDone)
@@ -225,20 +225,24 @@ func TestPool(t *testing.T) {
 					case <-disconnectDone:
 						return
 					default:
-						_, _ = p.get(getCtx)
-						noerr(t, err)
+						loopCtx, loopCancel := context.WithTimeout(getCtx, 3*time.Second)
+						c, err := p.get(loopCtx)
+						loopCancel()
+						if err == nil {
+							_ = p.put(c)
+						}
 						time.Sleep(time.Microsecond)
 					}
 				}
 			}()
 			go func() {
+				defer close(disconnectDone)
 				_, err := p.get(getCtx)
 				noerr(t, err)
 				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Microsecond)
 				defer cancel()
 				err = p.disconnect(ctx)
 				noerr(t, err)
-				close(disconnectDone)
 			}()
 			<-getDone
 			close(cleanup)
@@ -246,6 +250,13 @@ func TestPool(t *testing.T) {
 	})
 	t.Run("connect", func(t *testing.T) {
 		t.Run("can reconnect a disconnected pool", func(t *testing.T) {
+			assertGenerationMapState := func(t *testing.T, p *pool, expectedState int32) {
+				t.Helper()
+
+				actualState := atomic.LoadInt32(&p.generation.state)
+				assert.Equal(t, expectedState, actualState, "expected generation map state %d, got %d", expectedState, actualState)
+			}
+
 			cleanup := make(chan struct{})
 			addr := bootstrapConnections(t, 3, func(nc net.Conn) {
 				<-cleanup
@@ -259,6 +270,7 @@ func TestPool(t *testing.T) {
 			noerr(t, err)
 			err = p.connect()
 			noerr(t, err)
+			assertGenerationMapState(t, p, connected)
 			c, err := p.get(context.Background())
 			noerr(t, err)
 			gen := c.generation
@@ -277,6 +289,7 @@ func TestPool(t *testing.T) {
 			defer cancel()
 			err = p.disconnect(ctx)
 			noerr(t, err)
+			assertGenerationMapState(t, p, disconnected)
 
 			assertConnectionsClosed(t, d, 1)
 			if p.conns.totalSize != 0 {
@@ -289,13 +302,10 @@ func TestPool(t *testing.T) {
 			}
 			err = p.connect()
 			noerr(t, err)
+			assertGenerationMapState(t, p, connected)
 
 			c, err = p.get(context.Background())
 			noerr(t, err)
-			gen = atomic.LoadUint64(&c.generation)
-			if gen != 1 {
-				t.Errorf("Connection should have a newer generation. got %d; want %d", gen, 1)
-			}
 			err = p.put(c)
 			noerr(t, err)
 			if d.lenopened() != 2 {
@@ -675,16 +685,52 @@ func TestPool(t *testing.T) {
 				MinPoolSize: 1,
 			}
 			maintainInterval = time.Second
-			p, err := newPool(pc, WithDialer(func(Dialer) Dialer { return d }),
-				WithLifeTimeout(func(time.Duration) time.Duration { return 10 * time.Millisecond }),
-			)
+			p, err := newPool(pc, WithDialer(func(Dialer) Dialer { return d }))
 			maintainInterval = time.Minute
 			noerr(t, err)
 			err = p.connect()
 			noerr(t, err)
+
+			// Increment the pool's generation number so the connection will be considered stale and will be closed by
+			// get().
+			p.clear(nil)
 			_, err = p.get(context.Background())
 			noerr(t, err)
 		})
+	})
+	t.Run("wait queue timeout error", func(t *testing.T) {
+		cleanup := make(chan struct{})
+		addr := bootstrapConnections(t, 1, func(nc net.Conn) {
+			<-cleanup
+			_ = nc.Close()
+		})
+		d := newdialer(&net.Dialer{})
+		pc := poolConfig{
+			Address:     address.Address(addr.String()),
+			MaxPoolSize: 1,
+		}
+		p, err := newPool(pc, WithDialer(func(Dialer) Dialer { return d }))
+		noerr(t, err)
+		err = p.connect()
+		noerr(t, err)
+
+		// get first connection.
+		_, err = p.get(context.Background())
+		noerr(t, err)
+
+		// Set a short timeout and get again.
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+		defer cancel()
+		_, err = p.get(ctx)
+		assert.NotNil(t, err, "expected a WaitQueueTimeout; got nil")
+
+		// Assert that error received is WaitQueueTimeoutError with context deadline exceeded.
+		wqtErr, ok := err.(WaitQueueTimeoutError)
+		assert.True(t, ok, "expected a WaitQueueTimeoutError; got %v", err)
+		assert.True(t, wqtErr.Unwrap() == context.DeadlineExceeded,
+			"expected a timeout error; got %v", wqtErr)
+
+		close(cleanup)
 	})
 }
 
@@ -704,16 +750,15 @@ func (d *sleepDialer) DialContext(ctx context.Context, network, address string) 
 func assertConnectionsClosed(t *testing.T, dialer *dialer, expectedClosedCount int) {
 	t.Helper()
 
-	callback := func() error {
+	callback := func() {
 		for {
 			if dialer.lenclosed() == expectedClosedCount {
-				return nil
+				return
 			}
 
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
 
-	err := assert.RunWithTimeout(callback, 3*time.Second)
-	assert.Nil(t, err, "timed out waiting for connection closed count to hit %d", expectedClosedCount)
+	assert.Soon(t, callback, 3*time.Second)
 }

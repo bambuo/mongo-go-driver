@@ -25,9 +25,17 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/writeconcern"
 )
 
-const (
-	awsAccessKeyID     = "AWS_ACCESS_KEY_ID"
-	awsSecretAccessKey = "AWS_SECRET_ACCESS_KEY"
+var (
+	awsAccessKeyID         = os.Getenv("AWS_ACCESS_KEY_ID")
+	awsSecretAccessKey     = os.Getenv("AWS_SECRET_ACCESS_KEY")
+	awsTempAccessKeyID     = os.Getenv("CSFLE_AWS_TEMP_ACCESS_KEY_ID")
+	awsTempSecretAccessKey = os.Getenv("CSFLE_AWS_TEMP_SECRET_ACCESS_KEY")
+	awsTempSessionToken    = os.Getenv("CSFLE_AWS_TEMP_SESSION_TOKEN")
+	azureTenantID          = os.Getenv("AZURE_TENANT_ID")
+	azureClientID          = os.Getenv("AZURE_CLIENT_ID")
+	azureClientSecret      = os.Getenv("AZURE_CLIENT_SECRET")
+	gcpEmail               = os.Getenv("GCP_EMAIL")
+	gcpPrivateKey          = os.Getenv("GCP_PRIVATE_KEY")
 )
 
 // Helper functions to do read JSON spec test files and convert JSON objects into the appropriate driver types.
@@ -85,12 +93,20 @@ func createClientOptions(t testing.TB, opts bson.Raw) *options.ClientOptions {
 		case "readPreference":
 			clientOpts.SetReadPreference(readPrefFromString(opt.StringValue()))
 		case "heartbeatFrequencyMS":
-			hfms := time.Duration(opt.Int32()) * time.Millisecond
-			clientOpts.SetHeartbeatInterval(hfms)
+			hf := convertValueToMilliseconds(t, opt)
+			clientOpts.SetHeartbeatInterval(hf)
 		case "retryReads":
 			clientOpts.SetRetryReads(opt.Boolean())
 		case "autoEncryptOpts":
 			clientOpts.SetAutoEncryptionOptions(createAutoEncryptionOptions(t, opt.Document()))
+		case "appname":
+			clientOpts.SetAppName(opt.StringValue())
+		case "connectTimeoutMS":
+			ct := convertValueToMilliseconds(t, opt)
+			clientOpts.SetConnectTimeout(ct)
+		case "serverSelectionTimeoutMS":
+			sst := convertValueToMilliseconds(t, opt)
+			clientOpts.SetServerSelectionTimeout(sst)
 		default:
 			t.Fatalf("unrecognized client option: %v", name)
 		}
@@ -140,9 +156,6 @@ func createAutoEncryptionOptions(t testing.TB, opts bson.Raw) *options.AutoEncry
 func createKmsProvidersMap(t testing.TB, opts bson.Raw) map[string]map[string]interface{} {
 	t.Helper()
 
-	// aws: value is always empty object. create new map value from access key ID and secret access key
-	// local: value is {"key": primitive.Binary}. transform to {"key": []byte}
-
 	kmsMap := make(map[string]map[string]interface{})
 	elems, _ := opts.Elements()
 
@@ -152,26 +165,56 @@ func createKmsProvidersMap(t testing.TB, opts bson.Raw) map[string]map[string]in
 
 		switch provider {
 		case "aws":
-			keyID := os.Getenv(awsAccessKeyID)
-			if keyID == "" {
-				t.Fatalf("%s env var not set", awsAccessKeyID)
-			}
-			secretAccessKey := os.Getenv(awsSecretAccessKey)
-			if secretAccessKey == "" {
-				t.Fatalf("%s env var not set", awsSecretAccessKey)
-			}
-
 			awsMap := map[string]interface{}{
-				"accessKeyId":     keyID,
-				"secretAccessKey": secretAccessKey,
+				"accessKeyId":     awsAccessKeyID,
+				"secretAccessKey": awsSecretAccessKey,
 			}
 			kmsMap["aws"] = awsMap
+		case "azure":
+			kmsMap["azure"] = map[string]interface{}{
+				"tenantId":     azureTenantID,
+				"clientId":     azureClientID,
+				"clientSecret": azureClientSecret,
+			}
+		case "gcp":
+			kmsMap["gcp"] = map[string]interface{}{
+				"email":      gcpEmail,
+				"privateKey": gcpPrivateKey,
+			}
 		case "local":
 			_, key := providerOpt.Document().Lookup("key").Binary()
 			localMap := map[string]interface{}{
 				"key": key,
 			}
 			kmsMap["local"] = localMap
+		case "awsTemporary":
+			if awsTempAccessKeyID == "" {
+				t.Fatal("AWS temp access key ID not set")
+			}
+			if awsTempSecretAccessKey == "" {
+				t.Fatal("AWS temp secret access key not set")
+			}
+			if awsTempSessionToken == "" {
+				t.Fatal("AWS temp session token not set")
+			}
+			awsMap := map[string]interface{}{
+				"accessKeyId":     awsTempAccessKeyID,
+				"secretAccessKey": awsTempSecretAccessKey,
+				"sessionToken":    awsTempSessionToken,
+			}
+			kmsMap["aws"] = awsMap
+		case "awsTemporaryNoSessionToken":
+			if awsTempAccessKeyID == "" {
+				t.Fatal("AWS temp access key ID not set")
+			}
+			if awsTempSecretAccessKey == "" {
+				t.Fatal("AWS temp secret access key not set")
+			}
+			awsMap := map[string]interface{}{
+				"accessKeyId":     awsTempAccessKeyID,
+				"secretAccessKey": awsTempSecretAccessKey,
+			}
+			kmsMap["aws"] = awsMap
 		default:
 			t.Fatalf("unrecognized KMS provider: %v", provider)
 		}
@@ -310,7 +353,7 @@ func createWriteConcern(t testing.TB, opt bson.RawValue) *writeconcern.WriteConc
 
 		switch key {
 		case "wtimeout":
-			wtimeout := time.Duration(val.Int32()) * time.Millisecond
+			wtimeout := convertValueToMilliseconds(t, val)
 			opts = append(opts, writeconcern.WTimeout(wtimeout))
 		case "j":
 			opts = append(opts, writeconcern.J(val.Boolean()))
@@ -404,6 +447,39 @@ func errorFromResult(t testing.TB, result interface{}) *operationError {
 	return &expected
 }
 
+// errorDetails is a helper type that holds information that can be returned by driver functions in different error
+// types.
+type errorDetails struct {
+	name   string
+	labels []string
+}
+
+// extractErrorDetails creates an errorDetails instance based on the provided error. It returns the details and an "ok"
+// value which is true if the provided error is of a known type that can be processed.
+func extractErrorDetails(err error) (errorDetails, bool) {
+	var details errorDetails
+
+	switch converted := err.(type) {
+	case mongo.CommandError:
+		details.name = converted.Name
+		details.labels = converted.Labels
+	case mongo.WriteException:
+		if converted.WriteConcernError != nil {
+			details.name = converted.WriteConcernError.Name
+		}
+		details.labels = converted.Labels
+	case mongo.BulkWriteException:
+		if converted.WriteConcernError != nil {
+			details.name = converted.WriteConcernError.Name
+		}
+		details.labels = converted.Labels
+	default:
+		return errorDetails{}, false
+	}
+
+	return details, true
+}
+
 // verify that an error returned by an operation matches the expected error.
 func verifyError(expected *operationError, actual error) error {
 	// The spec test format doesn't treat ErrNoDocuments or ErrUnacknowledgedWrite as errors, so set actual to nil
@@ -431,23 +507,28 @@ func verifyError(expected *operationError, actual error) error {
 		}
 	}
 
-	cerr, ok := actual.(mongo.CommandError)
+	// Get an errorDetails instance for the error. If this fails but the test has expectations about the error name or
+	// labels, fail because we can't verify them.
+	details, ok := extractErrorDetails(actual)
 	if !ok {
+		if expected.ErrorCodeName != nil || len(expected.ErrorLabelsContain) > 0 || len(expected.ErrorLabelsOmit) > 0 {
+			return fmt.Errorf("failed to extract details from error %v of type %T", actual, actual)
+		}
 		return nil
 	}
 
 	if expected.ErrorCodeName != nil {
-		if *expected.ErrorCodeName != cerr.Name {
-			return fmt.Errorf("expected error name %v, got %v", *expected.ErrorCodeName, cerr.Name)
+		if *expected.ErrorCodeName != details.name {
+			return fmt.Errorf("expected error name %v, got %v", *expected.ErrorCodeName, details.name)
 		}
 	}
 	for _, label := range expected.ErrorLabelsContain {
-		if !cerr.HasErrorLabel(label) {
+		if !stringSliceContains(details.labels, label) {
 			return fmt.Errorf("expected error %v to contain label %q", actual, label)
 		}
 	}
 	for _, label := range expected.ErrorLabelsOmit {
-		if cerr.HasErrorLabel(label) {
+		if stringSliceContains(details.labels, label) {
 			return fmt.Errorf("expected error %v to not contain label %q", actual, label)
 		}
 	}
@@ -533,4 +614,23 @@ func createChangeStreamOptions(t testing.TB, opts bson.Raw) *options.ChangeStrea
 		}
 	}
 	return csOpts
+}
+
+func convertValueToMilliseconds(t testing.TB, val bson.RawValue) time.Duration {
+	t.Helper()
+
+	int32Val, ok := val.Int32OK()
+	if !ok {
+		t.Fatalf("failed to convert value of type %s to int32", val.Type)
+	}
+	return time.Duration(int32Val) * time.Millisecond
+}
+
+func stringSliceContains(stringSlice []string, target string) bool {
+	for _, str := range stringSlice {
+		if str == target {
+			return true
+		}
+	}
+	return false
 }

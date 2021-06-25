@@ -8,7 +8,7 @@ package integration
 
 import (
 	"fmt"
-	"path"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -17,6 +17,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/bsoncodec"
 	"go.mongodb.org/mongo-driver/bson/bsonrw"
+	"go.mongodb.org/mongo-driver/internal/testutil"
 	"go.mongodb.org/mongo-driver/internal/testutil/assert"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/integration/mtest"
@@ -26,8 +27,6 @@ import (
 	"go.mongodb.org/mongo-driver/x/mongo/driver"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/wiremessage"
 )
-
-const certificatesDir = "../../data/certificates"
 
 var noClientOpts = mtest.NewOptions().CreateClient(false)
 
@@ -81,65 +80,89 @@ func TestClient(t *testing.T) {
 		assert.Nil(mt, found, "SSLServerHasCertificateAuthority not found in result")
 	})
 	mt.RunOpts("x509", mtest.NewOptions().Auth(true).SSL(true), func(mt *mtest.T) {
-		const user = "C=US,ST=New York,L=New York City,O=MongoDB,OU=other,CN=external"
-		db := mt.Client.Database("$external")
-
-		// We don't care if the user doesn't already exist.
-		_ = db.RunCommand(
-			mtest.Background,
-			bson.D{{"dropUser", user}},
-		)
-		err := db.RunCommand(
-			mtest.Background,
-			bson.D{
-				{"createUser", user},
-				{"roles", bson.A{
-					bson.D{{"role", "readWrite"}, {"db", "test"}},
-				}},
+		testCases := []struct {
+			certificate string
+			password    string
+		}{
+			{
+				"MONGO_GO_DRIVER_KEY_FILE",
+				"",
 			},
-		).Err()
-		assert.Nil(mt, err, "createUser error: %v", err)
-
-		baseConnString := mt.ConnString()
-		// remove username/password from base conn string
-		revisedConnString := "mongodb://"
-		split := strings.Split(baseConnString, "@")
-		assert.Equal(t, 2, len(split), "expected 2 parts after split, got %v (connstring %v)", split, baseConnString)
-		revisedConnString += split[1]
-
-		cs := fmt.Sprintf(
-			"%s&sslClientCertificateKeyFile=%s&authMechanism=MONGODB-X509&authSource=$external",
-			revisedConnString,
-			path.Join(certificatesDir, "client.pem"),
-		)
-		authClient, err := mongo.Connect(mtest.Background, options.Client().ApplyURI(cs))
-		assert.Nil(mt, err, "authClient Connect error: %v", err)
-		defer func() { _ = authClient.Disconnect(mtest.Background) }()
-
-		rdr, err := authClient.Database("test").RunCommand(mtest.Background, bson.D{
-			{"connectionStatus", 1},
-		}).DecodeBytes()
-		assert.Nil(mt, err, "connectionStatus error: %v", err)
-		users, err := rdr.LookupErr("authInfo", "authenticatedUsers")
-		assert.Nil(mt, err, "authenticatedUsers not found in response")
-		elems, err := users.Array().Elements()
-		assert.Nil(mt, err, "error getting users elements: %v", err)
-
-		for _, userElem := range elems {
-			rdr := userElem.Value().Document()
-			var u struct {
-				User string
-				DB   string
-			}
-
-			if err := bson.Unmarshal(rdr, &u); err != nil {
-				continue
-			}
-			if u.User == user && u.DB == "$external" {
-				return
-			}
+			{
+				"MONGO_GO_DRIVER_PKCS8_ENCRYPTED_KEY_FILE",
+				"&sslClientCertificateKeyPassword=password",
+			},
+			{
+				"MONGO_GO_DRIVER_PKCS8_UNENCRYPTED_KEY_FILE",
+				"",
+			},
 		}
-		mt.Fatal("unable to find authenticated user")
+		for _, tc := range testCases {
+			mt.Run(tc.certificate, func(mt *mtest.T) {
+				const user = "C=US,ST=New York,L=New York City,O=MDB,OU=Drivers,CN=client"
+				db := mt.Client.Database("$external")
+
+				// We don't care if the user doesn't already exist.
+				_ = db.RunCommand(
+					mtest.Background,
+					bson.D{{"dropUser", user}},
+				)
+				err := db.RunCommand(
+					mtest.Background,
+					bson.D{
+						{"createUser", user},
+						{"roles", bson.A{
+							bson.D{{"role", "readWrite"}, {"db", "test"}},
+						}},
+					},
+				).Err()
+				assert.Nil(mt, err, "createUser error: %v", err)
+
+				baseConnString := mtest.ClusterURI()
+				// remove username/password from base conn string
+				revisedConnString := "mongodb://"
+				split := strings.Split(baseConnString, "@")
+				assert.Equal(t, 2, len(split), "expected 2 parts after split, got %v (connstring %v)", split, baseConnString)
+				revisedConnString += split[1]
+
+				cs := fmt.Sprintf(
+					"%s&sslClientCertificateKeyFile=%s&authMechanism=MONGODB-X509&authSource=$external%s",
+					revisedConnString,
+					os.Getenv(tc.certificate),
+					tc.password,
+				)
+				authClientOpts := options.Client().ApplyURI(cs)
+				testutil.AddTestServerAPIVersion(authClientOpts)
+				authClient, err := mongo.Connect(mtest.Background, authClientOpts)
+				assert.Nil(mt, err, "authClient Connect error: %v", err)
+				defer func() { _ = authClient.Disconnect(mtest.Background) }()
+
+				rdr, err := authClient.Database("test").RunCommand(mtest.Background, bson.D{
+					{"connectionStatus", 1},
+				}).DecodeBytes()
+				assert.Nil(mt, err, "connectionStatus error: %v", err)
+				users, err := rdr.LookupErr("authInfo", "authenticatedUsers")
+				assert.Nil(mt, err, "authenticatedUsers not found in response")
+				elems, err := users.Array().Elements()
+				assert.Nil(mt, err, "error getting users elements: %v", err)
+
+				for _, userElem := range elems {
+					rdr := userElem.Value().Document()
+					var u struct {
+						User string
+						DB   string
+					}
+
+					if err := bson.Unmarshal(rdr, &u); err != nil {
+						continue
+					}
+					if u.User == user && u.DB == "$external" {
+						return
+					}
+				}
+				mt.Fatal("unable to find authenticated user")
+			})
+		}
 	})
 	mt.RunOpts("list databases", noClientOpts, func(mt *mtest.T) {
 		mt.RunOpts("filter", noClientOpts, func(mt *mtest.T) {
@@ -254,6 +277,7 @@ func TestClient(t *testing.T) {
 			invalidClientOpts := options.Client().
 				SetServerSelectionTimeout(100 * time.Millisecond).SetHosts([]string{"invalid:123"}).
 				SetConnectTimeout(500 * time.Millisecond).SetSocketTimeout(500 * time.Millisecond)
+			testutil.AddTestServerAPIVersion(invalidClientOpts)
 			client, err := mongo.Connect(mtest.Background, invalidClientOpts)
 			assert.Nil(mt, err, "Connect error: %v", err)
 			err = client.Ping(mtest.Background, readpref.Primary())
@@ -269,7 +293,7 @@ func TestClient(t *testing.T) {
 	})
 	mt.RunOpts("watch", noClientOpts, func(mt *mtest.T) {
 		mt.Run("disconnected", func(mt *mtest.T) {
-			c, err := mongo.NewClient(options.Client().ApplyURI(mt.ConnString()))
+			c, err := mongo.NewClient(options.Client().ApplyURI(mtest.ClusterURI()))
 			assert.Nil(mt, err, "NewClient error: %v", err)
 			_, err = c.Watch(mtest.Background, mongo.Pipeline{})
 			assert.Equal(mt, mongo.ErrClientDisconnected, err, "expected error %v, got %v", mongo.ErrClientDisconnected, err)
@@ -391,7 +415,12 @@ func TestClient(t *testing.T) {
 		// First two messages should be connection handshakes: one for the heartbeat connection and the other for the
 		// application connection.
 		for idx, pair := range msgPairs[:2] {
-			assert.Equal(mt, pair.CommandName, "isMaster", "expected command name isMaster at index %d, got %s", idx,
+			helloCommand := "isMaster"
+			//  Expect "hello" command name with API version.
+			if os.Getenv("REQUIRE_API_VERSION") == "true" {
+				helloCommand = "hello"
+			}
+			assert.Equal(mt, pair.CommandName, helloCommand, "expected command name %s at index %d, got %s", helloCommand, idx,
 				pair.CommandName)
 
 			sent := pair.Sent
@@ -404,7 +433,7 @@ func TestClient(t *testing.T) {
 	})
 
 	// Test that direct connections work as expected.
-	firstServerAddr := mt.GlobalTopology().Description().Servers[0].Addr
+	firstServerAddr := mtest.GlobalTopology().Description().Servers[0].Addr
 	directConnectionOpts := options.Client().
 		ApplyURI(fmt.Sprintf("mongodb://%s", firstServerAddr)).
 		SetReadPreference(readpref.Primary()).

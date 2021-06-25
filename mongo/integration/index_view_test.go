@@ -8,6 +8,7 @@ package integration
 
 import (
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"go.mongodb.org/mongo-driver/bson"
@@ -16,6 +17,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/integration/mtest"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
 )
 
 type index struct {
@@ -28,9 +30,44 @@ func TestIndexView(t *testing.T) {
 	defer mt.Close()
 
 	mt.Run("list", func(mt *mtest.T) {
-		verifyIndexExists(mt, mt.Coll.Indexes(), index{
-			Key:  bson.D{{"_id", int32(1)}},
-			Name: "_id_",
+		createIndexes := func(mt *mtest.T, numIndexes int) {
+			mt.Helper()
+
+			models := make([]mongo.IndexModel, 0, numIndexes)
+			for i, key := 0, 'a'; i < numIndexes; i, key = i+1, key+1 {
+				models = append(models, mongo.IndexModel{
+					Keys: bson.M{string(key): 1},
+				})
+			}
+
+			_, err := mt.Coll.Indexes().CreateMany(mtest.Background, models)
+			assert.Nil(mt, err, "CreateMany error: %v", err)
+		}
+
+		// For server versions below 3.0, we internally execute List() as a legacy OP_QUERY against the system.indexes
+		// collection. Command monitoring upconversions translate this to a "find" command rather than "listIndexes".
+		cmdName := "listIndexes"
+		if mtest.CompareServerVersions(mtest.ServerVersion(), "3.0") < 0 {
+			cmdName = "find"
+		}
+
+		mt.Run("_id index is always listed", func(mt *mtest.T) {
+			verifyIndexExists(mt, mt.Coll.Indexes(), index{
+				Key:  bson.D{{"_id", int32(1)}},
+				Name: "_id_",
+			})
+		})
+		mt.Run("getMore commands are monitored", func(mt *mtest.T) {
+			createIndexes(mt, 2)
+			assertGetMoreCommandsAreMonitored(mt, cmdName, func() (*mongo.Cursor, error) {
+				return mt.Coll.Indexes().List(mtest.Background, options.ListIndexes().SetBatchSize(2))
+			})
+		})
+		mt.Run("killCursors commands are monitored", func(mt *mtest.T) {
+			createIndexes(mt, 2)
+			assertKillCursorsCommandsAreMonitored(mt, cmdName, func() (*mongo.Cursor, error) {
+				return mt.Coll.Indexes().List(mtest.Background, options.ListIndexes().SetBatchSize(2))
+			})
 		})
 	})
 	mt.RunOpts("create one", noClientOpts, func(mt *mtest.T) {
@@ -71,31 +108,36 @@ func TestIndexView(t *testing.T) {
 			})
 		})
 		mt.Run("all options", func(mt *mtest.T) {
+			opts := options.Index().
+				SetBackground(false).
+				SetExpireAfterSeconds(10).
+				SetName("a").
+				SetSparse(false).
+				SetUnique(false).
+				SetVersion(1).
+				SetDefaultLanguage("english").
+				SetLanguageOverride("english").
+				SetTextVersion(1).
+				SetWeights(bson.D{}).
+				SetSphereVersion(1).
+				SetBits(2).
+				SetMax(10).
+				SetMin(1).
+				SetPartialFilterExpression(bson.D{}).
+				SetStorageEngine(bson.D{
+					{"wiredTiger", bson.D{
+						{"configString", "block_compressor=zlib"},
+					}},
+				})
+
+			// Only check SetBucketSize if version is less than 4.9
+			if mtest.CompareServerVersions(mtest.ServerVersion(), "4.9") < 0 {
+				opts.SetBucketSize(1)
+			}
 			// Omits collation option because it's incompatible with version option
 			_, err := mt.Coll.Indexes().CreateOne(mtest.Background, mongo.IndexModel{
-				Keys: bson.D{{"foo", "text"}},
-				Options: options.Index().
-					SetBackground(false).
-					SetExpireAfterSeconds(10).
-					SetName("a").
-					SetSparse(false).
-					SetUnique(false).
-					SetVersion(1).
-					SetDefaultLanguage("english").
-					SetLanguageOverride("english").
-					SetTextVersion(1).
-					SetWeights(bson.D{}).
-					SetSphereVersion(1).
-					SetBits(2).
-					SetMax(10).
-					SetMin(1).
-					SetBucketSize(1).
-					SetPartialFilterExpression(bson.D{}).
-					SetStorageEngine(bson.D{
-						{"wiredTiger", bson.D{
-							{"configString", "block_compressor=zlib"},
-						}},
-					}),
+				Keys:    bson.D{{"foo", "text"}},
+				Options: opts,
 			})
 			assert.Nil(mt, err, "CreateOne error: %v", err)
 		})
@@ -218,6 +260,48 @@ func TestIndexView(t *testing.T) {
 				})
 			}
 		})
+		// Needs to run on these versions for failpoints
+		mt.RunOpts("replace error", mtest.NewOptions().Topologies(mtest.ReplicaSet).MinServerVersion("4.0"), func(mt *mtest.T) {
+			mt.SetFailPoint(mtest.FailPoint{
+				ConfigureFailPoint: "failCommand",
+				Mode:               "alwaysOn",
+				Data: mtest.FailPointData{
+					FailCommands: []string{"createIndexes"},
+					ErrorCode:    100,
+				},
+			})
+
+			_, err := mt.Coll.Indexes().CreateOne(mtest.Background, mongo.IndexModel{Keys: bson.D{{"x", 1}}})
+			assert.NotNil(mt, err, "expected CreateOne error, got nil")
+			cmdErr, ok := err.(mongo.CommandError)
+			assert.True(mt, ok, "expected mongo.CommandError, got %T", err)
+			assert.Equal(mt, int32(100), cmdErr.Code, "expected error code 100, got %v", cmdErr.Code)
+
+		})
+		mt.Run("multi-key map", func(mt *mtest.T) {
+			iv := mt.Coll.Indexes()
+
+			_, err := iv.CreateOne(mtest.Background, mongo.IndexModel{
+				Keys: bson.M{"foo": 1, "bar": -1},
+			})
+			assert.NotNil(mt, err, "expected CreateOne error, got nil")
+			assert.Equal(mt, mongo.ErrMapForOrderedArgument{"keys"}, err, "expected error %v, got %v", mongo.ErrMapForOrderedArgument{"key"}, err)
+		})
+		mt.Run("single key map", func(mt *mtest.T) {
+			iv := mt.Coll.Indexes()
+			expectedName := "foo_1"
+
+			indexName, err := iv.CreateOne(mtest.Background, mongo.IndexModel{
+				Keys: bson.M{"foo": 1},
+			})
+			assert.Nil(mt, err, "CreateOne error: %v", err)
+			assert.Equal(mt, expectedName, indexName, "expected name %q, got %q", expectedName, indexName)
+
+			verifyIndexExists(mt, iv, index{
+				Key:  bson.D{{"foo", int32(1)}},
+				Name: indexName,
+			})
+		})
 	})
 	mt.Run("create many", func(mt *mtest.T) {
 		mt.Run("success", func(mt *mtest.T) {
@@ -277,8 +361,11 @@ func TestIndexView(t *testing.T) {
 			majority := options.CreateIndexes().SetCommitQuorumMajority()
 			votingMembers := options.CreateIndexes().SetCommitQuorumVotingMembers()
 
-			indexModel := mongo.IndexModel{
+			indexModel1 := mongo.IndexModel{
 				Keys: bson.D{{"x", 1}},
+			}
+			indexModel2 := mongo.IndexModel{
+				Keys: bson.D{{"y", 1}},
 			}
 
 			testCases := []struct {
@@ -299,13 +386,13 @@ func TestIndexView(t *testing.T) {
 				mtOpts := mtest.NewOptions().MinServerVersion(tc.minServerVersion).MaxServerVersion(tc.maxServerVersion)
 				mt.RunOpts(tc.name, mtOpts, func(mt *mtest.T) {
 					mt.ClearEvents()
-					_, err := mt.Coll.Indexes().CreateOne(mtest.Background, indexModel, tc.opts)
+					_, err := mt.Coll.Indexes().CreateMany(mtest.Background, []mongo.IndexModel{indexModel1, indexModel2}, tc.opts)
 					if tc.expectError {
-						assert.NotNil(mt, err, "expected CreateOne error, got nil")
+						assert.NotNil(mt, err, "expected CreateMany error, got nil")
 						return
 					}
 
-					assert.Nil(mt, err, "CreateOne error: %v", err)
+					assert.Nil(mt, err, "CreateMany error: %v", err)
 					cmd := mt.GetStartedEvent().Command
 					sentBSONValue, err := cmd.LookupErr("commitQuorum")
 					assert.Nil(mt, err, "expected commitQuorum in command %s", cmd)
@@ -318,6 +405,100 @@ func TestIndexView(t *testing.T) {
 						tc.expectedValue, sentValue)
 				})
 			}
+		})
+		// Needs to run on these versions for failpoints
+		mt.RunOpts("replace error", mtest.NewOptions().Topologies(mtest.ReplicaSet).MinServerVersion("4.0"), func(mt *mtest.T) {
+			mt.SetFailPoint(mtest.FailPoint{
+				ConfigureFailPoint: "failCommand",
+				Mode:               "alwaysOn",
+				Data: mtest.FailPointData{
+					FailCommands: []string{"createIndexes"},
+					ErrorCode:    100,
+				},
+			})
+
+			_, err := mt.Coll.Indexes().CreateMany(mtest.Background, []mongo.IndexModel{
+				{
+					Keys: bson.D{{"foo", int32(-1)}},
+				},
+				{
+					Keys: bson.D{{"bar", int32(1)}, {"baz", int32(-1)}},
+				},
+			})
+			assert.NotNil(mt, err, "expected CreateMany error, got nil")
+			cmdErr, ok := err.(mongo.CommandError)
+			assert.True(mt, ok, "expected mongo.CommandError, got %T", err)
+			assert.Equal(mt, int32(100), cmdErr.Code, "expected error code 100, got %v", cmdErr.Code)
+
+		})
+		mt.Run("multi-key map", func(mt *mtest.T) {
+			iv := mt.Coll.Indexes()
+			_, err := iv.CreateMany(mtest.Background, []mongo.IndexModel{
+				{
+					Keys: bson.M{"foo": 1, "bar": -1},
+				},
+				{
+					Keys: bson.D{{"bar", int32(1)}, {"baz", int32(-1)}},
+				},
+			})
+			assert.NotNil(mt, err, "expected CreateOne error, got nil")
+			assert.Equal(mt, mongo.ErrMapForOrderedArgument{"keys"}, err, "expected error %v, got %v", mongo.ErrMapForOrderedArgument{"keys"}, err)
+		})
+		mt.Run("single key map", func(mt *mtest.T) {
+			iv := mt.Coll.Indexes()
+			firstKeysDoc := bson.M{"foo": -1}
+			secondKeysDoc := bson.D{{"bar", int32(1)}, {"baz", int32(-1)}}
+			expectedNames := []string{"foo_-1", "bar_1_baz_-1"}
+			indexNames, err := iv.CreateMany(mtest.Background, []mongo.IndexModel{
+				{
+					Keys: firstKeysDoc,
+				},
+				{
+					Keys: secondKeysDoc,
+				},
+			})
+			assert.Nil(mt, err, "CreateMany error: %v", err)
+			assert.Equal(mt, expectedNames, indexNames, "expected returned names %v, got %v", expectedNames, indexNames)
+
+			verifyIndexExists(mt, iv, index{
+				Key:  bson.D{{"foo", int32(-1)}},
+				Name: indexNames[0],
+			})
+			verifyIndexExists(mt, iv, index{
+				Key:  secondKeysDoc,
+				Name: indexNames[1],
+			})
+		})
+	})
+	mt.RunOpts("list specifications", noClientOpts, func(mt *mtest.T) {
+		mt.Run("verify results", func(mt *mtest.T) {
+			keysDoc := bsoncore.NewDocumentBuilder().AppendInt32("_id", 1).Build()
+			expectedSpec := &mongo.IndexSpecification{
+				Name:         "_id_",
+				Namespace:    mt.DB.Name() + "." + mt.Coll.Name(),
+				KeysDocument: bson.Raw(keysDoc),
+				Version:      2,
+			}
+			if mtest.CompareServerVersions(mtest.ServerVersion(), "3.4") < 0 {
+				expectedSpec.Version = 1
+			}
+
+			specs, err := mt.Coll.Indexes().ListSpecifications(mtest.Background)
+			assert.Nil(mt, err, "ListSpecifications error: %v", err)
+			assert.Equal(mt, 1, len(specs), "expected 1 specification, got %d", len(specs))
+			assert.Equal(mt, expectedSpec, specs[0], "expected specification %v, got %v", expectedSpec, specs[0])
+		})
+		mt.RunOpts("options passed to listIndexes", mtest.NewOptions().MinServerVersion("3.0"), func(mt *mtest.T) {
+			opts := options.ListIndexes().SetMaxTime(100 * time.Millisecond)
+			_, err := mt.Coll.Indexes().ListSpecifications(mtest.Background, opts)
+			assert.Nil(mt, err, "ListSpecifications error: %v", err)
+
+			evt := mt.GetStartedEvent()
+			assert.Equal(mt, evt.CommandName, "listIndexes", "expected %q command to be sent, got %q", "listIndexes",
+				evt.CommandName)
+			maxTimeMS, ok := evt.Command.Lookup("maxTimeMS").Int64OK()
+			assert.True(mt, ok, "expected command %v to contain %q field", evt.Command, "maxTimeMS")
+			assert.Equal(mt, int64(100), maxTimeMS, "expected maxTimeMS value to be 100, got %d", maxTimeMS)
 		})
 	})
 	mt.Run("drop one", func(mt *mtest.T) {
