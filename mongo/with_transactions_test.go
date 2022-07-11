@@ -28,11 +28,8 @@ import (
 )
 
 var (
-	connsCheckedOut        int
-	errorInterrupted       int32 = 11601
-	withTxnStartedEvents   []*event.CommandStartedEvent
-	withTxnSucceededEvents []*event.CommandSucceededEvent
-	withTxnFailedEvents    []*event.CommandFailedEvent
+	connsCheckedOut  int
+	errorInterrupted int32 = 11601
 )
 
 type wrappedError struct {
@@ -48,6 +45,10 @@ func (we wrappedError) Unwrap() error {
 }
 
 func TestConvenientTransactions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
 	client := setupConvenientTransactions(t)
 	db := client.Database("TestConvenientTransactions")
 	dbAdmin := client.Database("admin")
@@ -376,13 +377,11 @@ func TestConvenientTransactions(t *testing.T) {
 			}
 		}()
 
-		// Create context to manually cancel in callback.
-		cancelCtx, cancel := context.WithCancel(bgCtx)
-		defer cancel()
-
 		// Insert a document within a session and manually cancel context.
-		callback := func() {
-			_, _ = sess.WithTransaction(cancelCtx, func(sessCtx SessionContext) (interface{}, error) {
+		callback := func(ctx context.Context) {
+			transactionCtx, cancel := context.WithCancel(ctx)
+
+			_, _ = sess.WithTransaction(transactionCtx, func(sessCtx SessionContext) (interface{}, error) {
 				_, err := coll.InsertOne(sessCtx, bson.M{"x": 1})
 				assert.Nil(t, err, "InsertOne error: %v", err)
 				cancel()
@@ -433,10 +432,11 @@ func TestConvenientTransactions(t *testing.T) {
 		assert.Nil(t, err, "StartSession error: %v", err)
 		defer sess.EndSession(context.Background())
 
-		// Create context with short timeout.
-		withTransactionContext, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
-		defer cancel()
-		callback := func() {
+		callback := func(ctx context.Context) {
+			// Create transaction context with short timeout.
+			withTransactionContext, cancel := context.WithTimeout(ctx, time.Nanosecond)
+			defer cancel()
+
 			_, _ = sess.WithTransaction(withTransactionContext, func(sessCtx SessionContext) (interface{}, error) {
 				_, err := coll.InsertOne(sessCtx, bson.D{{}})
 				return nil, err
@@ -462,10 +462,11 @@ func TestConvenientTransactions(t *testing.T) {
 		assert.Nil(t, err, "StartSession error: %v", err)
 		defer sess.EndSession(context.Background())
 
-		// Create context and cancel it immediately.
-		withTransactionContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		cancel()
-		callback := func() {
+		callback := func(ctx context.Context) {
+			// Create transaction context and cancel it immediately.
+			withTransactionContext, cancel := context.WithTimeout(ctx, 2*time.Second)
+			cancel()
+
 			_, _ = sess.WithTransaction(withTransactionContext, func(sessCtx SessionContext) (interface{}, error) {
 				_, err := coll.InsertOne(sessCtx, bson.D{{}})
 				return nil, err
@@ -512,8 +513,8 @@ func TestConvenientTransactions(t *testing.T) {
 		assert.Nil(t, err, "StartSession error: %v", err)
 		defer sess.EndSession(context.Background())
 
-		callback := func() {
-			_, err = sess.WithTransaction(context.Background(), func(sessCtx SessionContext) (interface{}, error) {
+		callback := func(ctx context.Context) {
+			_, err = sess.WithTransaction(ctx, func(sessCtx SessionContext) (interface{}, error) {
 				// Set a timeout of 300ms to cause a timeout on first insertOne
 				// and force a retry.
 				c, cancel := context.WithTimeout(sessCtx, 300*time.Millisecond)
@@ -558,7 +559,7 @@ func setupConvenientTransactions(t *testing.T, extraClientOpts ...*options.Clien
 	version, err := getServerVersion(client.Database("admin"))
 	assert.Nil(t, err, "getServerVersion error: %v", err)
 	topoKind := client.deployment.(*topology.Topology).Kind()
-	if compareVersions(t, version, "4.1") < 0 || topoKind == description.Single {
+	if compareVersions(version, "4.1") < 0 || topoKind == description.Single {
 		t.Skip("skipping standalones and versions < 4.1")
 	}
 
@@ -597,7 +598,7 @@ func getServerVersion(db *Database) (string, error) {
 //
 // Returns a positive int if version1 is greater than version2, a negative int if version1 is less
 // than version2, and 0 if version1 is equal to version2.
-func compareVersions(t *testing.T, v1 string, v2 string) int {
+func compareVersions(v1 string, v2 string) int {
 	n1 := strings.Split(v1, ".")
 	n2 := strings.Split(v2, ".")
 

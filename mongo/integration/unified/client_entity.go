@@ -9,11 +9,13 @@ package unified
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/event"
+	"go.mongodb.org/mongo-driver/internal"
 	"go.mongodb.org/mongo-driver/internal/testutil"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/integration/mtest"
@@ -22,18 +24,23 @@ import (
 	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
 )
 
+// Security-sensitive commands that should be ignored in command monitoring by default.
+var securitySensitiveCommands = []string{"authenticate", "saslStart", "saslContinue", "getnonce",
+	"createUser", "updateUser", "copydbgetnonce", "copydbsaslstart", "copydb"}
+
 // clientEntity is a wrapper for a mongo.Client object that also holds additional information required during test
 // execution.
 type clientEntity struct {
 	*mongo.Client
 
-	recordEvents       atomic.Value
-	started            []*event.CommandStartedEvent
-	succeeded          []*event.CommandSucceededEvent
-	failed             []*event.CommandFailedEvent
-	pooled             []*event.PoolEvent
-	ignoredCommands    map[string]struct{}
-	numConnsCheckedOut int32
+	recordEvents             atomic.Value
+	started                  []*event.CommandStartedEvent
+	succeeded                []*event.CommandSucceededEvent
+	failed                   []*event.CommandFailedEvent
+	pooled                   []*event.PoolEvent
+	ignoredCommands          map[string]struct{}
+	observeSensitiveCommands *bool
+	numConnsCheckedOut       int32
 
 	// These should not be changed after the clientEntity is initialized
 	observedEvents map[monitoringEventType]struct{}
@@ -43,14 +50,23 @@ type clientEntity struct {
 }
 
 func newClientEntity(ctx context.Context, em *EntityMap, entityOptions *entityOptions) (*clientEntity, error) {
+	// The "configureFailPoint" command should always be ignored.
+	ignoredCommands := map[string]struct{}{
+		"configureFailPoint": {},
+	}
+	// If not observing sensitive commands, add security-sensitive commands
+	// to ignoredCommands by default.
+	if entityOptions.ObserveSensitiveCommands == nil || !*entityOptions.ObserveSensitiveCommands {
+		for _, cmd := range securitySensitiveCommands {
+			ignoredCommands[cmd] = struct{}{}
+		}
+	}
 	entity := &clientEntity{
-		// The "configureFailPoint" command should always be ignored.
-		ignoredCommands: map[string]struct{}{
-			"configureFailPoint": {},
-		},
-		observedEvents: make(map[monitoringEventType]struct{}),
-		storedEvents:   make(map[monitoringEventType][]string),
-		entityMap:      em,
+		ignoredCommands:          ignoredCommands,
+		observedEvents:           make(map[monitoringEventType]struct{}),
+		storedEvents:             make(map[monitoringEventType][]string),
+		entityMap:                em,
+		observeSensitiveCommands: entityOptions.ObserveSensitiveCommands,
 	}
 	entity.setRecordEvents(true)
 
@@ -126,11 +142,11 @@ func newClientEntity(ctx context.Context, em *EntityMap, entityOptions *entityOp
 }
 
 func getURIForClient(opts *entityOptions) string {
-	if mtest.ClusterTopologyKind() != mtest.LoadBalanced {
+	if mtest.Serverless() || mtest.ClusterTopologyKind() != mtest.LoadBalanced {
 		return mtest.ClusterURI()
 	}
 
-	// For load-balanced deployments, UseMultipleMongoses is used to determine the load balancer URI. If set to false,
+	// For non-serverless load-balanced deployments, UseMultipleMongoses is used to determine the load balancer URI. If set to false,
 	// the LB fronts a single server. If unset or explicitly true, the LB fronts multiple mongos servers.
 	switch {
 	case opts.UseMultipleMongoses != nil && !*opts.UseMultipleMongoses:
@@ -144,10 +160,29 @@ func (c *clientEntity) stopListeningForEvents() {
 	c.setRecordEvents(false)
 }
 
+func (c *clientEntity) isIgnoredEvent(commandName string, eventDoc bson.Raw) bool {
+	// Check if command is in ignoredCommands.
+	if _, ok := c.ignoredCommands[commandName]; ok {
+		return true
+	}
+
+	if commandName == "hello" || strings.ToLower(commandName) == internal.LegacyHelloLowercase {
+		// If observeSensitiveCommands is false (or unset) and hello command has been
+		// redacted at operation level, hello command should be ignored as it contained
+		// speculativeAuthenticate.
+		sensitiveCommandsIgnored := c.observeSensitiveCommands == nil || !*c.observeSensitiveCommands
+		redacted := len(eventDoc) == 0
+		if sensitiveCommandsIgnored && redacted {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *clientEntity) startedEvents() []*event.CommandStartedEvent {
 	var events []*event.CommandStartedEvent
 	for _, evt := range c.started {
-		if _, ok := c.ignoredCommands[evt.CommandName]; !ok {
+		if !c.isIgnoredEvent(evt.CommandName, evt.Command) {
 			events = append(events, evt)
 		}
 	}
@@ -158,7 +193,7 @@ func (c *clientEntity) startedEvents() []*event.CommandStartedEvent {
 func (c *clientEntity) succeededEvents() []*event.CommandSucceededEvent {
 	var events []*event.CommandSucceededEvent
 	for _, evt := range c.succeeded {
-		if _, ok := c.ignoredCommands[evt.CommandName]; !ok {
+		if !c.isIgnoredEvent(evt.CommandName, evt.Reply) {
 			events = append(events, evt)
 		}
 	}
@@ -355,6 +390,8 @@ func setClientOptionsFromURIOptions(clientOpts *options.ClientOptions, uriOpts b
 			wcSet = true
 		case "waitQueueTimeoutMS":
 			return newSkipTestError("the waitQueueTimeoutMS client option is not supported")
+		case "timeoutMS":
+			clientOpts.SetTimeout(time.Duration(value.(int32)) * time.Millisecond)
 		default:
 			return fmt.Errorf("unrecognized URI option %s", key)
 		}

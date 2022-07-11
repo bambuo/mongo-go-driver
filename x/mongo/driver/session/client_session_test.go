@@ -14,9 +14,9 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/internal/testutil/assert"
 	testhelpers "go.mongodb.org/mongo-driver/internal/testutil/helpers"
+	"go.mongodb.org/mongo-driver/internal/uuid"
 	"go.mongodb.org/mongo-driver/mongo/description"
 	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/uuid"
 )
 
 var consistent = true
@@ -192,6 +192,96 @@ func TestClientSession(t *testing.T) {
 		err = sess.CommitTransaction()
 		if err != ErrCommitAfterAbort {
 			t.Errorf("expected error, got %v", err)
+		}
+	})
+
+	t.Run("causal consistency and snapshot", func(t *testing.T) {
+		falseVal := false
+		trueVal := true
+
+		// A test for Consistent and Snapshot both being true and causing an error can be found
+		// in TestSessionsProse.
+		testCases := []struct {
+			description        string
+			consistent         *bool
+			snapshot           *bool
+			expectedConsistent bool
+			expectedSnapshot   bool
+		}{
+			{
+				"both unset",
+				nil,
+				nil,
+				true,
+				false,
+			},
+			{
+				"both false",
+				&falseVal,
+				&falseVal,
+				false,
+				false,
+			},
+			{
+				"cc unset snapshot true",
+				nil,
+				&trueVal,
+				false,
+				true,
+			},
+			{
+				"cc unset snapshot false",
+				nil,
+				&falseVal,
+				true,
+				false,
+			},
+			{
+				"cc true snapshot unset",
+				&trueVal,
+				nil,
+				true,
+				false,
+			},
+			{
+				"cc false snapshot unset",
+				&falseVal,
+				nil,
+				false,
+				false,
+			},
+			{
+				"cc false snapshot true",
+				&falseVal,
+				&trueVal,
+				false,
+				true,
+			},
+			{
+				"cc true snapshot false",
+				&trueVal,
+				&falseVal,
+				true,
+				false,
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.description, func(t *testing.T) {
+				sessOpts := &ClientOptions{
+					CausalConsistency: tc.consistent,
+					Snapshot:          tc.snapshot,
+				}
+
+				id, _ := uuid.New()
+				sess, err := NewClientSession(&Pool{}, id, Explicit, sessOpts)
+				require.Nil(t, err, "unexpected NewClientSession error %v", err)
+
+				require.Equal(t, tc.expectedConsistent, sess.Consistent,
+					"expected Consistent to be %v, got %v", tc.expectedConsistent, sess.Consistent)
+				require.Equal(t, tc.expectedSnapshot, sess.Snapshot,
+					"expected Snapshot to be %v, got %v", tc.expectedSnapshot, sess.Snapshot)
+			})
 		}
 	})
 }

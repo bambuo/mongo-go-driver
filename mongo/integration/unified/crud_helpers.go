@@ -51,6 +51,8 @@ func createUpdateArguments(args bson.Raw) (*updateArguments, error) {
 				return nil, fmt.Errorf("error creating collation: %v", err)
 			}
 			ua.opts.SetCollation(collation)
+		case "comment":
+			ua.opts.SetComment(val)
 		case "filter":
 			ua.filter = val.Document()
 		case "hint":
@@ -59,6 +61,8 @@ func createUpdateArguments(args bson.Raw) (*updateArguments, error) {
 				return nil, fmt.Errorf("error creating hint: %v", err)
 			}
 			ua.opts.SetHint(hint)
+		case "let":
+			ua.opts.SetLet(val.Document())
 		case "update":
 			ua.update, err = createUpdateValue(val)
 			if err != nil {
@@ -90,6 +94,7 @@ func createListCollectionsArguments(args bson.Raw) (*listCollectionsArguments, e
 		opts: options.ListCollections(),
 	}
 
+	lca.filter = emptyDocument
 	elems, _ := args.Elements()
 	for _, elem := range elems {
 		key := elem.Key()
@@ -105,9 +110,6 @@ func createListCollectionsArguments(args bson.Raw) (*listCollectionsArguments, e
 		default:
 			return nil, fmt.Errorf("unrecognized listCollections option %q", key)
 		}
-	}
-	if lca.filter == nil {
-		return nil, newMissingArgumentError("filter")
 	}
 
 	return lca, nil
@@ -156,4 +158,15 @@ func createHint(val bson.RawValue) (interface{}, error) {
 		return nil, fmt.Errorf("unrecognized hint value type %s", val.Type)
 	}
 	return hint, nil
+}
+
+func createCommentString(val bson.RawValue) (string, error) {
+	switch val.Type {
+	case bsontype.String:
+		return val.StringValue(), nil
+	case bsontype.EmbeddedDocument:
+		return val.String(), nil
+	default:
+		return "", fmt.Errorf("unrecognized 'comment' value type: %T", val)
+	}
 }

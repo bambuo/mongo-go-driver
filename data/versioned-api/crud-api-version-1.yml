@@ -1,6 +1,6 @@
 description: "CRUD Api Version 1"
 
-schemaVersion: "1.1"
+schemaVersion: "1.4"
 
 runOnRequirements:
   - minServerVersion: "4.9"
@@ -64,6 +64,10 @@ tests:
                 <<: *expectedApiVersion
 
   - description: "aggregate on database appends declared API version"
+    runOnRequirements:
+        # serverless does not support either of the current database-level aggregation stages ($listLocalSessions and
+        # $currentOp)
+      - serverless: forbid
     operations:
       - name: aggregate
         object: *adminDatabase
@@ -218,7 +222,12 @@ tests:
                 key: x
                 <<: *expectedApiVersion
 
-  - description: "estimatedDocumentCount appends declared API version on 4.9.0 or greater"
+  - description: "estimatedDocumentCount appends declared API version"
+    # See: https://jira.mongodb.org/browse/SERVER-63850
+    runOnRequirements:
+      - minServerVersion: "5.0.9"
+        maxServerVersion: "5.0.99"
+      - minServerVersion: "5.3.2"
     operations:
       - name: estimatedDocumentCount
         object: *collection
@@ -228,10 +237,7 @@ tests:
         events:
           - commandStartedEvent:
               command:
-                aggregate: *collectionName
-                pipeline: &pipeline
-                  - $collStats: { count: {} }
-                  - $group: { _id: 1, n: { $sum: $count }}
+                count: *collectionName
                 <<: *expectedApiVersion
 
   - description: "find and getMore append API version"

@@ -4,6 +4,7 @@
 // not use this file except in compliance with the License. You may obtain
 // a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
 
+//go:build cse
 // +build cse
 
 package mongocrypt
@@ -14,6 +15,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"strings"
 	"testing"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -124,9 +126,15 @@ func testKmsCtx(t *testing.T, ctx *Context, keyAltName bool) {
 	kmsCtx := ctx.NextKmsContext()
 	hostname, err := kmsCtx.HostName()
 	noerr(t, err)
+
+	// TODO GODRIVER-2217: Simply check if hostname != expectedHost once all OSes build the latest libmongocrypt
+	// TODO versions.
+	//
+	// Only check for the hostname. libmongocrypt versions that do not include MONGOCRYPT-352 will not
+	// include the default port "443".
 	expectedHost := "kms.us-east-1.amazonaws.com"
-	if hostname != expectedHost {
-		t.Fatalf("hostname mismatch; expected %s, got %s", expectedHost, hostname)
+	if !strings.Contains(hostname, expectedHost) {
+		t.Fatalf("hostname mismatch; expected %s to contain %s", hostname, expectedHost)
 	}
 
 	// get message to send to KMS

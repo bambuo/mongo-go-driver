@@ -7,9 +7,11 @@
 package integration
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"path"
 	"reflect"
 	"sync"
@@ -36,24 +38,41 @@ import (
 )
 
 const (
-	gridFSFiles       = "fs.files"
-	gridFSChunks      = "fs.chunks"
-	cseMaxVersionTest = "operation fails with maxWireVersion < 8"
+	gridFSFiles            = "fs.files"
+	gridFSChunks           = "fs.chunks"
+	spec1403SkipReason     = "servers less than 4.2 do not have mongocryptd; see SPEC-1403"
+	godriver2123SkipReason = "failpoints and timeouts together cause failures; see GODRIVER-2123"
+	godriver2413SkipReason = "encryptedFields argument is not supported on Collection.Drop; see GODRIVER-2413"
 )
 
 var (
 	defaultHeartbeatInterval = 50 * time.Millisecond
+	skippedTestDescriptions  = map[string]string{
+		// SPEC-1403: This test checks to see if the correct error is thrown when auto encrypting with a server < 4.2.
+		// Currently, the test will fail because a server < 4.2 wouldn't have mongocryptd, so Client construction
+		// would fail with a mongocryptd spawn error.
+		"operation fails with maxWireVersion < 8": spec1403SkipReason,
+		// GODRIVER-2123: The two tests below use a failpoint and a socket or server selection timeout.
+		// The timeout causes the eventual clearing of the failpoint in the test runner to fail with an
+		// i/o timeout.
+		"Ignore network timeout error on find":             godriver2123SkipReason,
+		"Network error on minPoolSize background creation": godriver2123SkipReason,
+		"CreateCollection from encryptedFields.":           godriver2413SkipReason,
+		"DropCollection from encryptedFields":              godriver2413SkipReason,
+		"DropCollection from remote encryptedFields":       godriver2413SkipReason,
+	}
 )
 
 type testFile struct {
-	RunOn          []mtest.RunOnBlock `bson:"runOn"`
-	DatabaseName   string             `bson:"database_name"`
-	CollectionName string             `bson:"collection_name"`
-	BucketName     string             `bson:"bucket_name"`
-	Data           testData           `bson:"data"`
-	JSONSchema     bson.Raw           `bson:"json_schema"`
-	KeyVaultData   []bson.Raw         `bson:"key_vault_data"`
-	Tests          []*testCase        `bson:"tests"`
+	RunOn           []mtest.RunOnBlock `bson:"runOn"`
+	DatabaseName    string             `bson:"database_name"`
+	CollectionName  string             `bson:"collection_name"`
+	BucketName      string             `bson:"bucket_name"`
+	Data            testData           `bson:"data"`
+	JSONSchema      bson.Raw           `bson:"json_schema"`
+	KeyVaultData    []bson.Raw         `bson:"key_vault_data"`
+	Tests           []*testCase        `bson:"tests"`
+	EncryptedFields bson.Raw           `bson:"encrypted_fields"`
 }
 
 type testData struct {
@@ -125,16 +144,19 @@ type operation struct {
 
 type expectation struct {
 	CommandStartedEvent *struct {
-		CommandName  string   `bson:"command_name"`
-		DatabaseName string   `bson:"database_name"`
-		Command      bson.Raw `bson:"command"`
+		CommandName  string                 `bson:"command_name"`
+		DatabaseName string                 `bson:"database_name"`
+		Command      bson.Raw               `bson:"command"`
+		Extra        map[string]interface{} `bson:",inline"`
 	} `bson:"command_started_event"`
 	CommandSucceededEvent *struct {
-		CommandName string   `bson:"command_name"`
-		Reply       bson.Raw `bson:"reply"`
+		CommandName string                 `bson:"command_name"`
+		Reply       bson.Raw               `bson:"reply"`
+		Extra       map[string]interface{} `bson:",inline"`
 	} `bson:"command_succeeded_event"`
 	CommandFailedEvent *struct {
-		CommandName string `bson:"command_name"`
+		CommandName string                 `bson:"command_name"`
+		Extra       map[string]interface{} `bson:",inline"`
 	} `bson:"command_failed_event"`
 }
 
@@ -160,7 +182,6 @@ var directories = []string{
 	"transactions/legacy",
 	"convenient-transactions",
 	"retryable-reads",
-	"sessions",
 	"read-write-concern/operation",
 	"server-discovery-and-monitoring/integration",
 	"atlas-data-lake-testing",
@@ -215,32 +236,35 @@ func runSpecTestCase(mt *mtest.T, test *testCase, testFile testFile) {
 		// pin to a single mongos
 		opts = opts.ClientType(mtest.Pinned)
 	}
+
+	cco := options.CreateCollection()
 	if len(testFile.JSONSchema) > 0 {
 		validator := bson.D{
 			{"$jsonSchema", testFile.JSONSchema},
 		}
-		opts.CollectionCreateOptions(bson.D{
-			{"validator", validator},
-		})
+		cco.SetValidator(validator)
 	}
+
+	if len(testFile.EncryptedFields) > 0 {
+		cco.SetEncryptedFields(testFile.EncryptedFields)
+	}
+
+	opts.CollectionCreateOptions(cco)
 
 	// Start the test without setting client options so the setup will be done with a default client.
 	mt.RunOpts(test.Description, opts, func(mt *mtest.T) {
 		if len(test.SkipReason) > 0 {
 			mt.Skip(test.SkipReason)
 		}
-		if test.Description == cseMaxVersionTest {
-			// This test checks to see if the correct error is thrown when auto encrypting with a server < 4.2.
-			// Currently, the test will fail because a server < 4.2 wouldn't have mongocryptd, so Client construction
-			// would fail with a mongocryptd spawn error. SPEC-1403 tracks the work to fix this.
-			mt.Skip("skipping maxWireVersion test")
+		if skipReason, ok := skippedTestDescriptions[test.Description]; ok {
+			mt.Skipf("skipping due to known failure: %v", skipReason)
 		}
 
 		// work around for SERVER-39704: run a non-transactional distinct against each shard in a sharded cluster
 		if mtest.ClusterTopologyKind() == mtest.Sharded && test.Description == "distinct" {
-			err := runCommandOnAllServers(mt, func(mongosClient *mongo.Client) error {
+			err := runCommandOnAllServers(func(mongosClient *mongo.Client) error {
 				coll := mongosClient.Database(mt.DB.Name()).Collection(mt.Coll.Name())
-				_, err := coll.Distinct(mtest.Background, "x", bson.D{})
+				_, err := coll.Distinct(context.Background(), "x", bson.D{})
 				return err
 			})
 			assert.Nil(mt, err, "error running distinct against all mongoses: %v", err)
@@ -259,10 +283,31 @@ func runSpecTestCase(mt *mtest.T, test *testCase, testFile testFile) {
 
 		// Reset the client using the client options specified in the test.
 		testClientOpts := createClientOptions(mt, test.ClientOptions)
+
+		// If AutoEncryptionOptions is set and AutoEncryption isn't disabled (neither
+		// bypassAutoEncryption nor bypassQueryAnalysis are true), then add extra options to load
+		// the crypt_shared library.
+		if testClientOpts.AutoEncryptionOptions != nil {
+			bypassAutoEncryption := testClientOpts.AutoEncryptionOptions.BypassAutoEncryption != nil &&
+				*testClientOpts.AutoEncryptionOptions.BypassAutoEncryption
+			bypassQueryAnalysis := testClientOpts.AutoEncryptionOptions.BypassQueryAnalysis != nil &&
+				*testClientOpts.AutoEncryptionOptions.BypassQueryAnalysis
+			if !bypassAutoEncryption && !bypassQueryAnalysis {
+				if testClientOpts.AutoEncryptionOptions.ExtraOptions == nil {
+					testClientOpts.AutoEncryptionOptions.ExtraOptions = make(map[string]interface{})
+				}
+
+				for k, v := range getCryptSharedLibExtraOptions() {
+					testClientOpts.AutoEncryptionOptions.ExtraOptions[k] = v
+				}
+			}
+		}
+
 		test.monitor = newUnifiedRunnerEventMonitor()
 		testClientOpts.SetPoolMonitor(&event.PoolMonitor{
 			Event: test.monitor.handlePoolEvent,
 		})
+		testClientOpts.SetServerMonitor(test.monitor.sdamMonitor)
 		if testClientOpts.HeartbeatInterval == nil {
 			// If one isn't specified in the test, use a low heartbeat frequency so the Client will quickly recover when
 			// using failpoints that cause SDAM state changes.
@@ -279,8 +324,8 @@ func runSpecTestCase(mt *mtest.T, test *testCase, testFile testFile) {
 		sess0, sess1 := setupSessions(mt, test)
 		if sess0 != nil {
 			defer func() {
-				sess0.EndSession(mtest.Background)
-				sess1.EndSession(mtest.Background)
+				sess0.EndSession(context.Background())
+				sess1.EndSession(context.Background())
 			}()
 		}
 
@@ -293,8 +338,8 @@ func runSpecTestCase(mt *mtest.T, test *testCase, testFile testFile) {
 
 		// Needs to be done here (in spite of defer) because some tests
 		// require end session to be called before we check expectation
-		sess0.EndSession(mtest.Background)
-		sess1.EndSession(mtest.Background)
+		sess0.EndSession(context.Background())
+		sess1.EndSession(context.Background())
 		mt.ClearFailPoints()
 
 		checkExpectations(mt, test.Expectations, sess0.ID(), sess1.ID())
@@ -423,13 +468,13 @@ func executeTestRunnerOperation(mt *mtest.T, testCase *testCase, op *operation, 
 		targetHost := clientSession.PinnedServer.Addr.String()
 		opts := options.Client().ApplyURI(mtest.ClusterURI()).SetHosts([]string{targetHost})
 		testutil.AddTestServerAPIVersion(opts)
-		client, err := mongo.Connect(mtest.Background, opts)
+		client, err := mongo.Connect(context.Background(), opts)
 		if err != nil {
 			return fmt.Errorf("Connect error for targeted client: %v", err)
 		}
-		defer func() { _ = client.Disconnect(mtest.Background) }()
+		defer func() { _ = client.Disconnect(context.Background()) }()
 
-		if err = client.Database("admin").RunCommand(mtest.Background, fp).Err(); err != nil {
+		if err = client.Database("admin").RunCommand(context.Background(), fp).Err(); err != nil {
 			return fmt.Errorf("error setting targeted fail point: %v", err)
 		}
 		mt.TrackFailPoint(fp.ConfigureFailPoint)
@@ -437,6 +482,21 @@ func executeTestRunnerOperation(mt *mtest.T, testCase *testCase, op *operation, 
 		fp, err := op.Arguments.LookupErr("failPoint")
 		assert.Nil(mt, err, "failPoint not found in arguments")
 		mt.SetFailPointFromDocument(fp.Document())
+	case "assertSessionTransactionState":
+		stateVal, err := op.Arguments.LookupErr("state")
+		assert.Nil(mt, err, "state not found in arguments")
+		expectedState, ok := stateVal.StringValueOK()
+		assert.True(mt, ok, "state argument is not a string")
+
+		assert.NotNil(mt, clientSession, "expected valid session, got nil")
+		actualState := clientSession.TransactionState.String()
+
+		// actualState should match expectedState, but "in progress" is the same as
+		// "in_progress".
+		stateMatch := actualState == expectedState ||
+			actualState == "in progress" && expectedState == "in_progress"
+		assert.True(mt, stateMatch, "expected transaction state %v, got %v",
+			expectedState, actualState)
 	case "assertSessionPinned":
 		if clientSession.PinnedServer == nil {
 			return errors.New("expected pinned server, got nil")
@@ -447,10 +507,6 @@ func executeTestRunnerOperation(mt *mtest.T, testCase *testCase, op *operation, 
 		if clientSession.PinnedServer != nil {
 			return fmt.Errorf("expected pinned server to be nil but got %q", clientSession.PinnedServer.Addr)
 		}
-	case "assertSessionDirty":
-		return verifyDirtySessionState(clientSession, true)
-	case "assertSessionNotDirty":
-		return verifyDirtySessionState(clientSession, false)
 	case "assertSameLsidOnLastTwoCommands":
 		first, second := lastTwoIDs(mt)
 		if !first.Equal(second) {
@@ -462,13 +518,13 @@ func executeTestRunnerOperation(mt *mtest.T, testCase *testCase, op *operation, 
 			return fmt.Errorf("expected last two lsids to be not equal but both were %v", first)
 		}
 	case "assertCollectionExists":
-		return verifyCollectionState(mt, op, true)
+		return verifyCollectionState(op, true)
 	case "assertCollectionNotExists":
-		return verifyCollectionState(mt, op, false)
+		return verifyCollectionState(op, false)
 	case "assertIndexExists":
-		return verifyIndexState(mt, op, true)
+		return verifyIndexState(op, true)
 	case "assertIndexNotExists":
-		return verifyIndexState(mt, op, false)
+		return verifyIndexState(op, false)
 	case "wait":
 		time.Sleep(convertValueToMilliseconds(mt, op.Arguments.Lookup("ms")))
 	case "waitForEvent":
@@ -494,22 +550,12 @@ func executeTestRunnerOperation(mt *mtest.T, testCase *testCase, op *operation, 
 	return nil
 }
 
-func verifyDirtySessionState(clientSession *session.Client, expectedDirty bool) error {
-	if clientSession.Server == nil {
-		return errors.New("expected valid server session, got nil")
-	}
-	if markedDirty := clientSession.Server.Dirty; markedDirty != expectedDirty {
-		return fmt.Errorf("expected server session to be marked dirty: %v, got %v", expectedDirty, markedDirty)
-	}
-	return nil
-}
-
-func verifyIndexState(mt *mtest.T, op *operation, shouldExist bool) error {
+func verifyIndexState(op *operation, shouldExist bool) error {
 	db := op.Arguments.Lookup("database").StringValue()
 	coll := op.Arguments.Lookup("collection").StringValue()
 	index := op.Arguments.Lookup("index").StringValue()
 
-	exists, err := indexExists(mt, db, coll, index)
+	exists, err := indexExists(db, coll, index)
 	if err != nil {
 		return err
 	}
@@ -520,16 +566,16 @@ func verifyIndexState(mt *mtest.T, op *operation, shouldExist bool) error {
 	return nil
 }
 
-func indexExists(mt *mtest.T, dbName, collName, indexName string) (bool, error) {
+func indexExists(dbName, collName, indexName string) (bool, error) {
 	// Use global client because listIndexes cannot be executed inside a transaction.
 	iv := mtest.GlobalClient().Database(dbName).Collection(collName).Indexes()
-	cursor, err := iv.List(mtest.Background)
+	cursor, err := iv.List(context.Background())
 	if err != nil {
 		return false, fmt.Errorf("IndexView.List error: %v", err)
 	}
-	defer cursor.Close(mtest.Background)
+	defer cursor.Close(context.Background())
 
-	for cursor.Next(mtest.Background) {
+	for cursor.Next(context.Background()) {
 		if cursor.Current.Lookup("name").StringValue() == indexName {
 			return true, nil
 		}
@@ -537,11 +583,11 @@ func indexExists(mt *mtest.T, dbName, collName, indexName string) (bool, error) 
 	return false, cursor.Err()
 }
 
-func verifyCollectionState(mt *mtest.T, op *operation, shouldExist bool) error {
+func verifyCollectionState(op *operation, shouldExist bool) error {
 	db := op.Arguments.Lookup("database").StringValue()
 	coll := op.Arguments.Lookup("collection").StringValue()
 
-	exists, err := collectionExists(mt, db, coll)
+	exists, err := collectionExists(db, coll)
 	if err != nil {
 		return err
 	}
@@ -552,13 +598,13 @@ func verifyCollectionState(mt *mtest.T, op *operation, shouldExist bool) error {
 	return nil
 }
 
-func collectionExists(mt *mtest.T, dbName, collName string) (bool, error) {
+func collectionExists(dbName, collName string) (bool, error) {
 	filter := bson.D{
 		{"name", collName},
 	}
 
 	// Use global client because listCollections cannot be executed inside a transaction.
-	collections, err := mtest.GlobalClient().Database(dbName).ListCollectionNames(mtest.Background, filter)
+	collections, err := mtest.GlobalClient().Database(dbName).ListCollectionNames(context.Background(), filter)
 	if err != nil {
 		return false, fmt.Errorf("ListCollectionNames error: %v", err)
 	}
@@ -584,14 +630,11 @@ func executeSessionOperation(mt *mtest.T, op *operation, sess mongo.Session) err
 		}
 		return sess.StartTransaction(txnOpts)
 	case "commitTransaction":
-		return sess.CommitTransaction(mtest.Background)
+		return sess.CommitTransaction(context.Background())
 	case "abortTransaction":
-		return sess.AbortTransaction(mtest.Background)
+		return sess.AbortTransaction(context.Background())
 	case "withTransaction":
 		return executeWithTransaction(mt, sess, op.Arguments)
-	case "endSession":
-		sess.EndSession(mtest.Background)
-		return nil
 	default:
 		mt.Fatalf("unrecognized session operation: %v", op.Name)
 	}
@@ -629,7 +672,7 @@ func executeCollectionOperation(mt *mtest.T, op *operation, sess mongo.Session) 
 		cursor, err := executeFind(mt, sess, op.Arguments)
 		if op.opError == nil && err == nil {
 			verifyCursorResult(mt, cursor, op.Result)
-			_ = cursor.Close(mtest.Background)
+			_ = cursor.Close(context.Background())
 		}
 		return err
 	case "findOneAndDelete":
@@ -684,7 +727,7 @@ func executeCollectionOperation(mt *mtest.T, op *operation, sess mongo.Session) 
 		cursor, err := executeAggregate(mt, mt.Coll, sess, op.Arguments)
 		if op.opError == nil && err == nil {
 			verifyCursorResult(mt, cursor, op.Result)
-			_ = cursor.Close(mtest.Background)
+			_ = cursor.Close(context.Background())
 		}
 		return err
 	case "bulkWrite":
@@ -709,14 +752,14 @@ func executeCollectionOperation(mt *mtest.T, op *operation, sess mongo.Session) 
 		cursor, err := executeListIndexes(mt, sess, op.Arguments)
 		if op.opError == nil && err == nil {
 			verifyCursorResult(mt, cursor, op.Result)
-			_ = cursor.Close(mtest.Background)
+			_ = cursor.Close(context.Background())
 		}
 		return err
 	case "watch":
 		stream, err := executeWatch(mt, mt.Coll, sess, op.Arguments)
 		if op.opError == nil && err == nil {
 			assert.Nil(mt, op.Result, "unexpected result for watch: %v", op.Result)
-			_ = stream.Close(mtest.Background)
+			_ = stream.Close(context.Background())
 		}
 		return err
 	case "createIndex":
@@ -754,14 +797,14 @@ func executeDatabaseOperation(mt *mtest.T, op *operation, sess mongo.Session) er
 		cursor, err := executeAggregate(mt, mt.DB, sess, op.Arguments)
 		if op.opError == nil && err == nil {
 			verifyCursorResult(mt, cursor, op.Result)
-			_ = cursor.Close(mtest.Background)
+			_ = cursor.Close(context.Background())
 		}
 		return err
 	case "listCollections":
 		cursor, err := executeListCollections(mt, sess, op.Arguments)
 		if op.opError == nil && err == nil {
 			assert.Nil(mt, op.Result, "unexpected result for listCollections: %v", op.Result)
-			_ = cursor.Close(mtest.Background)
+			_ = cursor.Close(context.Background())
 		}
 		return err
 	case "listCollectionNames":
@@ -774,7 +817,7 @@ func executeDatabaseOperation(mt *mtest.T, op *operation, sess mongo.Session) er
 		stream, err := executeWatch(mt, mt.DB, sess, op.Arguments)
 		if op.opError == nil && err == nil {
 			assert.Nil(mt, op.Result, "unexpected result for watch: %v", op.Result)
-			_ = stream.Close(mtest.Background)
+			_ = stream.Close(context.Background())
 		}
 		return err
 	case "dropCollection":
@@ -815,7 +858,7 @@ func executeClientOperation(mt *mtest.T, op *operation, sess mongo.Session) erro
 		stream, err := executeWatch(mt, mt.Client, sess, op.Arguments)
 		if op.opError == nil && err == nil {
 			assert.Nil(mt, op.Result, "unexpected result for watch: %v", op.Result)
-			_ = stream.Close(mtest.Background)
+			_ = stream.Close(context.Background())
 		}
 		return err
 	case "listDatabaseObjects":
@@ -853,7 +896,7 @@ func insertDocuments(mt *mtest.T, coll *mongo.Collection, rawDocs []bson.Raw) {
 		return
 	}
 
-	_, err := coll.InsertMany(mtest.Background, docsToInsert)
+	_, err := coll.InsertMany(context.Background(), docsToInsert)
 	assert.Nil(mt, err, "InsertMany error for collection %v: %v", coll.Name(), err)
 }
 
@@ -863,6 +906,10 @@ func setupTest(mt *mtest.T, testFile *testFile, testCase *testCase) {
 
 	// key vault data
 	if len(testFile.KeyVaultData) > 0 {
+		// Drop the key vault collection in case it exists from a prior test run.
+		err := mt.Client.Database("keyvault").Collection("datakeys").Drop(context.Background())
+		assert.Nil(mt, err, "error dropping key vault collection")
+
 		keyVaultColl := mt.CreateCollection(mtest.Collection{
 			Name: "datakeys",
 			DB:   "keyvault",
@@ -912,7 +959,7 @@ func verifyTestOutcome(mt *mtest.T, outcomeColl *outcomeCollection) {
 
 	findOpts := options.Find().
 		SetSort(bson.M{"_id": 1})
-	cursor, err := coll.Find(mtest.Background, bson.D{}, findOpts)
+	cursor, err := coll.Find(context.Background(), bson.D{}, findOpts)
 	assert.Nil(mt, err, "Find error: %v", err)
 	verifyCursorResult(mt, cursor, outcomeColl.Data)
 }
@@ -922,4 +969,17 @@ func getTopologyFromClient(client *mongo.Client) *topology.Topology {
 	deploymentField := clientElem.FieldByName("deployment")
 	deploymentField = reflect.NewAt(deploymentField.Type(), unsafe.Pointer(deploymentField.UnsafeAddr())).Elem()
 	return deploymentField.Interface().(*topology.Topology)
+}
+
+// getCryptSharedLibExtraOptions returns an AutoEncryption extra options map with crypt_shared
+// library path information if the CRYPT_SHARED_LIB_PATH environment variable is set.
+func getCryptSharedLibExtraOptions() map[string]interface{} {
+	path := os.Getenv("CRYPT_SHARED_LIB_PATH")
+	if path == "" {
+		return nil
+	}
+	return map[string]interface{}{
+		"cryptSharedLibRequired": true,
+		"cryptSharedLibPath":     path,
+	}
 }

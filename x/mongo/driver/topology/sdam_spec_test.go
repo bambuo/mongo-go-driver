@@ -29,11 +29,11 @@ import (
 )
 
 type response struct {
-	Host     string
-	IsMaster IsMaster
+	Host  string
+	Hello Hello
 }
 
-type IsMaster struct {
+type Hello struct {
 	Arbiters                     []string           `bson:"arbiters,omitempty"`
 	ArbiterOnly                  bool               `bson:"arbiterOnly,omitempty"`
 	ClusterTime                  bson.Raw           `bson:"$clusterTime,omitempty"`
@@ -41,7 +41,8 @@ type IsMaster struct {
 	ElectionID                   primitive.ObjectID `bson:"electionId,omitempty"`
 	Hidden                       bool               `bson:"hidden,omitempty"`
 	Hosts                        []string           `bson:"hosts,omitempty"`
-	IsMaster                     bool               `bson:"ismaster,omitempty"`
+	HelloOK                      bool               `bson:"helloOk,omitempty"`
+	IsWritablePrimary            bool               `bson:"isWritablePrimary,omitempty"`
 	IsReplicaSet                 bool               `bson:"isreplicaset,omitempty"`
 	LastWrite                    *lastWriteDate     `bson:"lastWrite,omitempty"`
 	LogicalSessionTimeoutMinutes uint32             `bson:"logicalSessionTimeoutMinutes,omitempty"`
@@ -213,8 +214,8 @@ func (r *response) UnmarshalBSON(buf []byte) error {
 		return fmt.Errorf("error unmarshalling Host: %v", err)
 	}
 
-	if err := doc.Index(1).Value().Unmarshal(&r.IsMaster); err != nil {
-		return fmt.Errorf("error unmarshalling IsMaster: %v", err)
+	if err := doc.Index(1).Value().Unmarshal(&r.Hello); err != nil {
+		return fmt.Errorf("error unmarshalling Hello: %v", err)
 	}
 
 	return nil
@@ -265,7 +266,7 @@ func applyResponses(t *testing.T, topo *Topology, responses []response, sub *dri
 	default:
 	}
 	for _, response := range responses {
-		doc, err := bson.Marshal(response.IsMaster)
+		doc, err := bson.Marshal(response.Hello)
 		assert.Nil(t, err, "Marshal error: %v", err)
 
 		addr := address.Address(response.Host)
@@ -331,7 +332,7 @@ func applyErrors(t *testing.T, topo *Topology, errors []applicationError) {
 
 		generation := server.pool.generation.getGeneration(nil)
 		if appErr.Generation != nil {
-			generation = uint64(*appErr.Generation)
+			generation = *appErr.Generation
 		}
 		//use generation number to check conn stale
 		innerConn := connection{
@@ -363,14 +364,14 @@ func compareServerDescriptions(t *testing.T,
 		"%v: expected %d hosts, got %d", idx, len(expected.Hosts), len(actual.Hosts))
 	for idx, expectedHost := range expected.Hosts {
 		actualHost := actual.Hosts[idx]
-		assert.Equal(t, expectedHost, string(actualHost), "%v: expected host %s, got %s", idx, expectedHost, actualHost)
+		assert.Equal(t, expectedHost, actualHost, "%v: expected host %s, got %s", idx, expectedHost, actualHost)
 	}
 
 	assert.Equal(t, len(expected.Passives), len(actual.Passives),
 		"%v: expected %d hosts, got %d", idx, len(expected.Passives), len(actual.Passives))
 	for idx, expectedPassive := range expected.Passives {
 		actualPassive := actual.Passives[idx]
-		assert.Equal(t, expectedPassive, string(actualPassive), "%v: expected passive %s, got %s", idx, expectedPassive, actualPassive)
+		assert.Equal(t, expectedPassive, actualPassive, "%v: expected passive %s, got %s", idx, expectedPassive, actualPassive)
 	}
 
 	assert.Equal(t, expected.Primary, string(actual.Primary),
@@ -418,7 +419,7 @@ func compareEvents(t *testing.T, events []monitoringEvent) {
 		if me.TopologyOpeningEvent != nil {
 			actual, ok := publishedEvents[idx].(event.TopologyOpeningEvent)
 			assert.True(t, ok, "%v: expected type %T, got %T", idx, event.TopologyOpeningEvent{}, publishedEvents[idx])
-			assert.False(t, primitive.ObjectID(actual.TopologyID).IsZero(), "%v: expected topology id", idx)
+			assert.False(t, actual.TopologyID.IsZero(), "%v: expected topology id", idx)
 		}
 		if me.ServerOpeningEvent != nil {
 			actual, ok := publishedEvents[idx].(event.ServerOpeningEvent)
@@ -427,7 +428,7 @@ func compareEvents(t *testing.T, events []monitoringEvent) {
 			evt := me.ServerOpeningEvent
 			assert.Equal(t, evt.Address, string(actual.Address),
 				"%v: expected address %s, got %s", idx, evt.Address, actual.Address)
-			assert.False(t, primitive.ObjectID(actual.TopologyID).IsZero(), "%v: expected topology id", idx)
+			assert.False(t, actual.TopologyID.IsZero(), "%v: expected topology id", idx)
 		}
 		if me.TopologyDescriptionChangedEvent != nil {
 			actual, ok := publishedEvents[idx].(event.TopologyDescriptionChangedEvent)
@@ -436,7 +437,7 @@ func compareEvents(t *testing.T, events []monitoringEvent) {
 			evt := me.TopologyDescriptionChangedEvent
 			compareTopologyDescriptions(t, evt.PreviousDescription, actual.PreviousDescription, idx)
 			compareTopologyDescriptions(t, evt.NewDescription, actual.NewDescription, idx)
-			assert.False(t, primitive.ObjectID(actual.TopologyID).IsZero(), "%v: expected topology id", idx)
+			assert.False(t, actual.TopologyID.IsZero(), "%v: expected topology id", idx)
 		}
 		if me.ServerDescriptionChangedEvent != nil {
 			actual, ok := publishedEvents[idx].(event.ServerDescriptionChangedEvent)
@@ -447,7 +448,7 @@ func compareEvents(t *testing.T, events []monitoringEvent) {
 				"%v: expected server address %s, got %s", idx, evt.Address, actual.Address)
 			compareServerDescriptions(t, evt.PreviousDescription, actual.PreviousDescription, idx)
 			compareServerDescriptions(t, evt.NewDescription, actual.NewDescription, idx)
-			assert.False(t, primitive.ObjectID(actual.TopologyID).IsZero(), "%v: expected topology id", idx)
+			assert.False(t, actual.TopologyID.IsZero(), "%v: expected topology id", idx)
 		}
 		if me.ServerClosedEvent != nil {
 			actual, ok := publishedEvents[idx].(event.ServerClosedEvent)
@@ -456,7 +457,7 @@ func compareEvents(t *testing.T, events []monitoringEvent) {
 			evt := me.ServerClosedEvent
 			assert.Equal(t, evt.Address, string(actual.Address),
 				"%v: expected server address %s, got %s", idx, evt.Address, actual.Address)
-			assert.False(t, primitive.ObjectID(actual.TopologyID).IsZero(), "%v: expected topology id", idx)
+			assert.False(t, actual.TopologyID.IsZero(), "%v: expected topology id", idx)
 		}
 	}
 }

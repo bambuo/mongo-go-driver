@@ -54,8 +54,11 @@ type RunOnBlock struct {
 	MinServerVersion string                   `bson:"minServerVersion"`
 	MaxServerVersion string                   `bson:"maxServerVersion"`
 	Topology         []TopologyKind           `bson:"topology"`
+	Serverless       string                   `bson:"serverless"`
 	ServerParameters map[string]bson.RawValue `bson:"serverParameters"`
 	Auth             *bool                    `bson:"auth"`
+	AuthEnabled      *bool                    `bson:"authEnabled"`
+	CSFLE            *bool                    `bson:"csfle"`
 }
 
 // UnmarshalBSON implements custom BSON unmarshalling behavior for RunOnBlock because some test formats use the
@@ -66,8 +69,11 @@ func (r *RunOnBlock) UnmarshalBSON(data []byte) error {
 		MaxServerVersion string                   `bson:"maxServerVersion"`
 		Topology         []TopologyKind           `bson:"topology"`
 		Topologies       []TopologyKind           `bson:"topologies"`
+		Serverless       string                   `bson:"serverless"`
 		ServerParameters map[string]bson.RawValue `bson:"serverParameters"`
 		Auth             *bool                    `bson:"auth"`
+		AuthEnabled      *bool                    `bson:"authEnabled"`
+		CSFLE            *bool                    `bson:"csfle"`
 		Extra            map[string]interface{}   `bson:",inline"`
 	}
 	if err := bson.Unmarshal(data, &temp); err != nil {
@@ -79,8 +85,11 @@ func (r *RunOnBlock) UnmarshalBSON(data []byte) error {
 
 	r.MinServerVersion = temp.MinServerVersion
 	r.MaxServerVersion = temp.MaxServerVersion
+	r.Serverless = temp.Serverless
 	r.ServerParameters = temp.ServerParameters
 	r.Auth = temp.Auth
+	r.AuthEnabled = temp.AuthEnabled
+	r.CSFLE = temp.CSFLE
 
 	if temp.Topology != nil {
 		r.Topology = temp.Topology
@@ -108,10 +117,8 @@ func NewOptions() *Options {
 	return &Options{}
 }
 
-// CollectionCreateOptions sets the options to pass to the create command when creating a collection for a test.
-// For example, if opts = {"capped": "true"}, the create command sent to the server will be
-// {create: <collectionName>, foo: bar}.
-func (op *Options) CollectionCreateOptions(opts bson.D) *Options {
+// CollectionCreateOptions sets the options to pass to Database.CreateCollection() when creating a collection for a test.
+func (op *Options) CollectionCreateOptions(opts *options.CreateCollectionOptions) *Options {
 	op.optFuncs = append(op.optFuncs, func(t *T) {
 		t.collCreateOpts = opts
 	})

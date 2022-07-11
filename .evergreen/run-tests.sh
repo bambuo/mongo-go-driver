@@ -10,21 +10,6 @@ if [ "Windows_NT" = "$OS" ]; then
     export GOPATH=$(cygpath -m $GOPATH)
     export GOCACHE=$(cygpath -m $GOCACHE)
     export DRIVERS_TOOLS=$(cygpath -m $DRIVERS_TOOLS)
-
-    if [ ! -d "c:/libmongocrypt/include" ]; then
-        mkdir -p c:/libmongocrypt/include
-        mkdir -p c:/libmongocrypt/bin
-        curl https://s3.amazonaws.com/mciuploads/libmongocrypt/windows/latest_release/libmongocrypt.tar.gz --output libmongocrypt.tar.gz
-        tar -xvzf libmongocrypt.tar.gz
-        cp ./bin/mongocrypt.dll c:/libmongocrypt/bin
-        cp ./include/mongocrypt/*.h c:/libmongocrypt/include
-        export PATH=$PATH:/cygdrive/c/libmongocrypt/bin
-    fi
-else
-    if [ ! -d "libmongocrypt" ]; then
-        git clone https://github.com/mongodb/libmongocrypt
-        ./libmongocrypt/.evergreen/compile.sh
-    fi
 fi
 
 export GOROOT="${GOROOT}"
@@ -84,6 +69,50 @@ if [ -z ${GO_BUILD_TAGS+x} ]; then
   GO_BUILD_TAGS="cse"
 fi
 
+# If the task doesn't have the SKIP_CRYPT_SHARED_LIB_DOWNLOAD variable set, try to find the
+# crypt_shared library downloaded in the "prepare-resources" task and set the CRYPT_SHARED_LIB_PATH
+# environment variable with a path to the file.
+if [ "${SKIP_CRYPT_SHARED_LIB_DOWNLOAD}" != "true" ]; then
+  # Find the crypt_shared library file in the current directory and set the CRYPT_SHARED_LIB_PATH to
+  # the path of that file. Only look for .so, .dll, or .dylib files to prevent matching any other
+  # downloaded files.
+  export CRYPT_SHARED_LIB_PATH="$(find $(pwd) -maxdepth 1 -type f \
+    -name 'mongo_crypt_v1.so' -o \
+    -name 'mongo_crypt_v1.dll' -o \
+    -name 'mongo_crypt_v1.dylib')"
+
+  # Expect that we always find a crypt_shared library file and set the CRYPT_SHARED_LIB_PATH
+  # environment variable. If we didn't, print an error message and exit.
+  if [ -z "$CRYPT_SHARED_LIB_PATH" ]; then
+    echo 'SKIP_CRYPT_SHARED_LIB_DOWNLOAD is not "true", but CRYPT_SHARED_LIB_PATH is empty. Exiting.'
+    exit 1
+  fi
+
+  # If we're on Windows, convert the "cygdrive"  path to Windows-style paths.
+  if [ "Windows_NT" = "$OS" ]; then
+      export CRYPT_SHARED_LIB_PATH=$(cygpath -m $CRYPT_SHARED_LIB_PATH)
+  fi
+
+  echo "CRYPT_SHARED_LIB_PATH=$CRYPT_SHARED_LIB_PATH"
+fi
+
+# Ensure mock KMS servers are running before starting tests.
+await_server() {
+  for i in $(seq 300); do
+      # Exit code 7: "Failed to connect to host".
+      if curl -s "localhost:$2"; test $? -ne 7; then
+        return 0
+      else
+        sleep 1
+      fi
+  done
+  echo "could not detect '$1' server on port $2"
+}
+# * List servers to await here ...
+await_server "KMS", 5698
+
+echo "finished awaiting servers"
+
 AUTH=${AUTH} \
 SSL=${SSL} \
 MONGO_GO_DRIVER_CA_FILE=${MONGO_GO_DRIVER_CA_FILE} \
@@ -105,6 +134,8 @@ AZURE_CLIENT_ID="${cse_azure_client_id}" \
 AZURE_CLIENT_SECRET="${cse_azure_client_secret}" \
 GCP_EMAIL="${cse_gcp_email}" \
 GCP_PRIVATE_KEY="${cse_gcp_private_key}" \
+CSFLE_TLS_CA_FILE="$DRIVERS_TOOLS/.evergreen/x509gen/ca.pem" \
+CSFLE_TLS_CERTIFICATE_KEY_FILE="$DRIVERS_TOOLS/.evergreen/x509gen/client.pem" \
 make evg-test \
 PKG_CONFIG_PATH=$PKG_CONFIG_PATH \
 LD_LIBRARY_PATH=$LD_LIBRARY_PATH

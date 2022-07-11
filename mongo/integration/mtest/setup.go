@@ -54,6 +54,7 @@ var testContext struct {
 	serverParameters            bson.Raw
 	singleMongosLoadBalancerURI string
 	multiMongosLoadBalancerURI  string
+	serverless                  bool
 }
 
 func setupClient(cs connstring.ConnString, opts *options.ClientOptions) (*mongo.Client, error) {
@@ -64,7 +65,7 @@ func setupClient(cs connstring.ConnString, opts *options.ClientOptions) (*mongo.
 	}
 	// for sharded clusters, pin to one host. Due to how the cache is implemented on 4.0 and 4.2, behavior
 	// can be inconsistent when multiple mongoses are used
-	return mongo.Connect(Background, opts.ApplyURI(cs.Original).SetWriteConcern(wcMajority).SetHosts(cs.Hosts[:1]))
+	return mongo.Connect(context.Background(), opts.ApplyURI(cs.Original).SetWriteConcern(wcMajority).SetHosts(cs.Hosts[:1]))
 }
 
 // Setup initializes the current testing context.
@@ -123,7 +124,7 @@ func Setup(setupOpts ...*SetupOptions) error {
 		return fmt.Errorf("error connecting test client: %v", err)
 	}
 
-	pingCtx, cancel := context.WithTimeout(Background, 2*time.Second)
+	pingCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := testContext.client.Ping(pingCtx, readpref.Primary()); err != nil {
 		return fmt.Errorf("ping error: %v; make sure the deployment is running on URI %v", err,
@@ -150,16 +151,16 @@ func Setup(setupOpts ...*SetupOptions) error {
 	// If we're connected to a sharded cluster, determine if the cluster is backed by replica sets.
 	if testContext.topoKind == Sharded {
 		// Run a find against config.shards and get each document in the collection.
-		cursor, err := testContext.client.Database("config").Collection("shards").Find(Background, bson.D{})
+		cursor, err := testContext.client.Database("config").Collection("shards").Find(context.Background(), bson.D{})
 		if err != nil {
 			return fmt.Errorf("error running find against config.shards: %v", err)
 		}
-		defer cursor.Close(Background)
+		defer cursor.Close(context.Background())
 
 		var shards []struct {
 			Host string `bson:"host"`
 		}
-		if err := cursor.All(Background, &shards); err != nil {
+		if err := cursor.All(context.Background(), &shards); err != nil {
 			return fmt.Errorf("error getting results find against config.shards: %v", err)
 		}
 
@@ -168,7 +169,7 @@ func Setup(setupOpts ...*SetupOptions) error {
 		// the shard is a standalone if the "/" character isn't present.
 		var foundStandalone bool
 		for _, shard := range shards {
-			if strings.Index(shard.Host, "/") == -1 {
+			if !strings.Contains(shard.Host, "/") {
 				foundStandalone = true
 				break
 			}
@@ -178,25 +179,32 @@ func Setup(setupOpts ...*SetupOptions) error {
 		}
 	}
 
-	// For load balanced clusters, retrieve the required LB URIs and add additional information (e.g. TLS options) to
+	// For non-serverless, load balanced clusters, retrieve the required LB URIs and add additional information (e.g. TLS options) to
 	// them if necessary.
-	if testContext.topoKind == LoadBalanced {
+	testContext.serverless = os.Getenv("SERVERLESS") == "serverless"
+	if !testContext.serverless && testContext.topoKind == LoadBalanced {
 		singleMongosURI := os.Getenv("SINGLE_MONGOS_LB_URI")
 		if singleMongosURI == "" {
 			return errors.New("SINGLE_MONGOS_LB_URI must be set when running against load balanced clusters")
 		}
-		testContext.singleMongosLoadBalancerURI = addNecessaryParamsToURI(singleMongosURI)
+		testContext.singleMongosLoadBalancerURI, err = addNecessaryParamsToURI(singleMongosURI)
+		if err != nil {
+			return fmt.Errorf("error getting single mongos load balancer uri: %v", err)
+		}
 
 		multiMongosURI := os.Getenv("MULTI_MONGOS_LB_URI")
 		if multiMongosURI == "" {
 			return errors.New("MULTI_MONGOS_LB_URI must be set when running against load balanced clusters")
 		}
-		testContext.multiMongosLoadBalancerURI = addNecessaryParamsToURI(multiMongosURI)
+		testContext.multiMongosLoadBalancerURI, err = addNecessaryParamsToURI(multiMongosURI)
+		if err != nil {
+			return fmt.Errorf("error getting multi mongos load balancer uri: %v", err)
+		}
 	}
 
 	testContext.authEnabled = os.Getenv("AUTH") == "auth"
 	testContext.sslEnabled = os.Getenv("SSL") == "ssl"
-	biRes, err := testContext.client.Database("admin").RunCommand(Background, bson.D{{"buildInfo", 1}}).DecodeBytes()
+	biRes, err := testContext.client.Database("admin").RunCommand(context.Background(), bson.D{{"buildInfo", 1}}).DecodeBytes()
 	if err != nil {
 		return fmt.Errorf("buildInfo error: %v", err)
 	}
@@ -215,7 +223,7 @@ func Setup(setupOpts ...*SetupOptions) error {
 	// Get server parameters if test is not running against ADL; ADL does not have "getParameter" command.
 	if !testContext.dataLake {
 		db := testContext.client.Database("admin")
-		testContext.serverParameters, err = db.RunCommand(Background, bson.D{{"getParameter", "*"}}).DecodeBytes()
+		testContext.serverParameters, err = db.RunCommand(context.Background(), bson.D{{"getParameter", "*"}}).DecodeBytes()
 		if err != nil {
 			return fmt.Errorf("error getting serverParameters: %v", err)
 		}
@@ -228,14 +236,14 @@ func Setup(setupOpts ...*SetupOptions) error {
 func Teardown() error {
 	// Dropping the test database causes an error against Atlas Data Lake.
 	if !testContext.dataLake {
-		if err := testContext.client.Database(TestDb).Drop(Background); err != nil {
+		if err := testContext.client.Database(TestDb).Drop(context.Background()); err != nil {
 			return fmt.Errorf("error dropping test database: %v", err)
 		}
 	}
-	if err := testContext.client.Disconnect(Background); err != nil {
+	if err := testContext.client.Disconnect(context.Background()); err != nil {
 		return fmt.Errorf("error disconnecting test client: %v", err)
 	}
-	if err := testContext.topo.Disconnect(Background); err != nil {
+	if err := testContext.topo.Disconnect(context.Background()); err != nil {
 		return fmt.Errorf("error disconnecting test topology: %v", err)
 	}
 	return nil
@@ -244,7 +252,7 @@ func Teardown() error {
 func getServerVersion() (string, error) {
 	var serverStatus bson.Raw
 	err := testContext.client.Database(TestDb).RunCommand(
-		Background,
+		context.Background(),
 		bson.D{{"buildInfo", 1}},
 	).Decode(&serverStatus)
 	if err != nil {
@@ -281,12 +289,15 @@ func addOptions(uri string, opts ...string) string {
 // addTLSConfig checks for the environmental variable indicating that the tests are being run
 // on an SSL-enabled server, and if so, returns a new URI with the necessary configuration.
 func addTLSConfig(uri string) string {
+	if os.Getenv("SSL") == "ssl" {
+		uri = addOptions(uri, "ssl=", "true")
+	}
 	caFile := os.Getenv("MONGO_GO_DRIVER_CA_FILE")
 	if len(caFile) == 0 {
 		return uri
 	}
 
-	return addOptions(uri, "ssl=true&sslCertificateAuthorityFile=", caFile)
+	return addOptions(uri, "sslCertificateAuthorityFile=", caFile)
 }
 
 // addCompressors checks for the environment variable indicating that the tests are being run with compression
@@ -300,19 +311,50 @@ func addCompressors(uri string) string {
 	return addOptions(uri, "compressors=", comp)
 }
 
+func addServerlessAuthCredentials(uri string) (string, error) {
+	if os.Getenv("SERVERLESS") != "serverless" {
+		return uri, nil
+	}
+	user := os.Getenv("SERVERLESS_ATLAS_USER")
+	if user == "" {
+		return "", fmt.Errorf("serverless expects SERVERLESS_ATLAS_USER to be set")
+	}
+	password := os.Getenv("SERVERLESS_ATLAS_PASSWORD")
+	if password == "" {
+		return "", fmt.Errorf("serverless expects SERVERLESS_ATLAS_PASSWORD to be set")
+	}
+
+	var scheme string
+	// remove the scheme
+	if strings.HasPrefix(uri, "mongodb+srv://") {
+		scheme = "mongodb+srv://"
+	} else if strings.HasPrefix(uri, "mongodb://") {
+		scheme = "mongodb://"
+	} else {
+		return "", fmt.Errorf("scheme must be \"mongodb\" or \"mongodb+srv\"")
+	}
+
+	uri = scheme + user + ":" + password + "@" + uri[len(scheme):]
+	return uri, nil
+}
+
 // getClusterConnString gets the globally configured connection string.
 func getClusterConnString() (connstring.ConnString, error) {
 	uri := os.Getenv("MONGODB_URI")
 	if uri == "" {
 		uri = "mongodb://localhost:27017"
 	}
-	uri = addNecessaryParamsToURI(uri)
+	uri, err := addNecessaryParamsToURI(uri)
+	if err != nil {
+		return connstring.ConnString{}, err
+	}
 	return connstring.ParseAndValidate(uri)
 }
 
-func addNecessaryParamsToURI(uri string) string {
+func addNecessaryParamsToURI(uri string) (string, error) {
 	uri = addTLSConfig(uri)
-	return addCompressors(uri)
+	uri = addCompressors(uri)
+	return addServerlessAuthCredentials(uri)
 }
 
 // CompareServerVersions compares two version number strings (i.e. positive integers separated by

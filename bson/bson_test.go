@@ -10,12 +10,12 @@ import (
 	"bytes"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson/bsoncodec"
 	"go.mongodb.org/mongo-driver/bson/bsonoptions"
 	"go.mongodb.org/mongo-driver/bson/bsontype"
@@ -29,10 +29,6 @@ func noerr(t *testing.T, err error) {
 		t.Errorf("Unexpected error: (%T)%v", err, err)
 		t.FailNow()
 	}
-}
-
-func requireErrEqual(t *testing.T, err1 error, err2 error) {
-	require.True(t, compareErrors(err1, err2))
 }
 
 func TestTimeRoundTrip(t *testing.T) {
@@ -133,15 +129,38 @@ func (kb keyBool) MarshalKey() (string, error) {
 	return fmt.Sprintf("%v", kb), nil
 }
 
-func (kb keyBool) UnmarshalKey(key string) error {
+func (kb *keyBool) UnmarshalKey(key string) error {
 	switch key {
 	case "true":
-		kb = true
+		*kb = true
 	case "false":
-		kb = false
+		*kb = false
 	default:
 		return fmt.Errorf("invalid bool value %v", key)
 	}
+	return nil
+}
+
+type keyStruct struct {
+	val int64
+}
+
+func (k keyStruct) MarshalText() (text []byte, err error) {
+	str := strconv.FormatInt(k.val, 10)
+
+	return []byte(str), nil
+}
+
+func (k *keyStruct) UnmarshalText(text []byte) error {
+	val, err := strconv.ParseInt(string(text), 10, 64)
+	if err != nil {
+		return err
+	}
+
+	*k = keyStruct{
+		val: val,
+	}
+
 	return nil
 }
 
@@ -168,17 +187,37 @@ func TestMapCodec(t *testing.T) {
 			})
 		}
 	})
+
 	t.Run("keys implements keyMarshaler and keyUnmarshaler", func(t *testing.T) {
-		mapObj := map[keyBool]int{keyBool(false): 1}
+		mapObj := map[keyBool]int{keyBool(true): 1}
 
 		doc, err := Marshal(mapObj)
 		assert.Nil(t, err, "Marshal error: %v", err)
 		idx, want := bsoncore.AppendDocumentStart(nil)
-		want = bsoncore.AppendInt32Element(want, "false", 1)
+		want = bsoncore.AppendInt32Element(want, "true", 1)
 		want, _ = bsoncore.AppendDocumentEnd(want, idx)
 		assert.Equal(t, want, doc, "expected result %v, got %v", string(want), string(doc))
 
 		var got map[keyBool]int
+		err = Unmarshal(doc, &got)
+		assert.Nil(t, err, "Unmarshal error: %v", err)
+		assert.Equal(t, mapObj, got, "expected result %v, got %v", mapObj, got)
+
+	})
+
+	t.Run("keys implements encoding.TextMarshaler and encoding.TextUnmarshaler", func(t *testing.T) {
+		mapObj := map[keyStruct]int{
+			{val: 10}: 100,
+		}
+
+		doc, err := Marshal(mapObj)
+		assert.Nil(t, err, "Marshal error: %v", err)
+		idx, want := bsoncore.AppendDocumentStart(nil)
+		want = bsoncore.AppendInt32Element(want, "10", 100)
+		want, _ = bsoncore.AppendDocumentEnd(want, idx)
+		assert.Equal(t, want, doc, "expected result %v, got %v", string(want), string(doc))
+
+		var got map[keyStruct]int
 		err = Unmarshal(doc, &got)
 		assert.Nil(t, err, "Unmarshal error: %v", err)
 		assert.Equal(t, mapObj, got, "expected result %v, got %v", mapObj, got)

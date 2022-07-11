@@ -17,38 +17,26 @@ import (
 	"go.mongodb.org/mongo-driver/event"
 )
 
-var (
-	connectionClosedReasons = map[string]string{
-		"stale":      event.ReasonStale,
-		"idle":       event.ReasonIdle,
-		"error":      event.ReasonConnectionErrored,
-		"poolClosed": event.ReasonPoolClosed,
-	}
-
-	checkOutFailedReasons = map[string]string{
-		"poolClosed":      event.ReasonPoolClosed,
-		"timeout":         event.ReasonTimedOut,
-		"connectionError": event.ReasonConnectionErrored,
-	}
-)
-
 type commandMonitoringEvent struct {
 	CommandStartedEvent *struct {
-		Command      bson.Raw `bson:"command"`
-		CommandName  *string  `bson:"commandName"`
-		DatabaseName *string  `bson:"databaseName"`
-		HasServiceID *bool    `bson:"hasServiceId"`
+		Command               bson.Raw `bson:"command"`
+		CommandName           *string  `bson:"commandName"`
+		DatabaseName          *string  `bson:"databaseName"`
+		HasServerConnectionID *bool    `bson:"hasServerConnectionId"`
+		HasServiceID          *bool    `bson:"hasServiceId"`
 	} `bson:"commandStartedEvent"`
 
 	CommandSucceededEvent *struct {
-		CommandName  *string  `bson:"commandName"`
-		Reply        bson.Raw `bson:"reply"`
-		HasServiceID *bool    `bson:"hasServiceId"`
+		CommandName           *string  `bson:"commandName"`
+		Reply                 bson.Raw `bson:"reply"`
+		HasServerConnectionID *bool    `bson:"hasServerConnectionId"`
+		HasServiceID          *bool    `bson:"hasServiceId"`
 	} `bson:"commandSucceededEvent"`
 
 	CommandFailedEvent *struct {
-		CommandName  *string `bson:"commandName"`
-		HasServiceID *bool   `bson:"hasServiceId"`
+		CommandName           *string `bson:"commandName"`
+		HasServerConnectionID *bool   `bson:"hasServerConnectionId"`
+		HasServiceID          *bool   `bson:"hasServiceId"`
 	} `bson:"commandFailedEvent"`
 }
 
@@ -75,9 +63,10 @@ type cmapEvent struct {
 }
 
 type expectedEvents struct {
-	ClientID      string `bson:"client"`
-	CommandEvents []commandMonitoringEvent
-	CMAPEvents    []cmapEvent
+	ClientID          string `bson:"client"`
+	CommandEvents     []commandMonitoringEvent
+	CMAPEvents        []cmapEvent
+	IgnoreExtraEvents *bool
 }
 
 var _ bson.Unmarshaler = (*expectedEvents)(nil)
@@ -87,10 +76,11 @@ func (e *expectedEvents) UnmarshalBSON(data []byte) error {
 	// We use the "eventType" value to determine which struct field should be used to deserialize the "events" array.
 
 	var temp struct {
-		ClientID  string                 `bson:"client"`
-		EventType string                 `bson:"eventType"`
-		Events    bson.RawValue          `bson:"events"`
-		Extra     map[string]interface{} `bson:",inline"`
+		ClientID          string                 `bson:"client"`
+		EventType         string                 `bson:"eventType"`
+		Events            bson.RawValue          `bson:"events"`
+		IgnoreExtraEvents *bool                  `bson:"ignoreExtraEvents"`
+		Extra             map[string]interface{} `bson:",inline"`
 	}
 	if err := bson.Unmarshal(data, &temp); err != nil {
 		return fmt.Errorf("error unmarshalling to temporary expectedEvents object: %v", err)
@@ -117,6 +107,10 @@ func (e *expectedEvents) UnmarshalBSON(data []byte) error {
 	if err := temp.Events.Unmarshal(target); err != nil {
 		return fmt.Errorf("error unmarshalling events array: %v", err)
 	}
+
+	if temp.IgnoreExtraEvents != nil {
+		e.IgnoreExtraEvents = temp.IgnoreExtraEvents
+	}
 	return nil
 }
 
@@ -128,24 +122,24 @@ func verifyEvents(ctx context.Context, expectedEvents *expectedEvents) error {
 
 	switch {
 	case expectedEvents.CommandEvents != nil:
-		return verifyCommandEvents(ctx, client, expectedEvents.CommandEvents)
+		return verifyCommandEvents(ctx, client, expectedEvents)
 	case expectedEvents.CMAPEvents != nil:
-		return verifyCMAPEvents(client, expectedEvents.CMAPEvents)
+		return verifyCMAPEvents(client, expectedEvents)
 	}
 	return nil
 }
 
-func verifyCommandEvents(ctx context.Context, client *clientEntity, expectedEvents []commandMonitoringEvent) error {
+func verifyCommandEvents(ctx context.Context, client *clientEntity, expectedEvents *expectedEvents) error {
 	started := client.startedEvents()
 	succeeded := client.succeededEvents()
 	failed := client.failedEvents()
 
 	// If the Events array is nil, verify that no events were sent.
-	if len(expectedEvents) == 0 && (len(started)+len(succeeded)+len(failed) != 0) {
+	if len(expectedEvents.CommandEvents) == 0 && (len(started)+len(succeeded)+len(failed) != 0) {
 		return fmt.Errorf("expected no events to be sent but got %s", stringifyEventsForClient(client))
 	}
 
-	for idx, evt := range expectedEvents {
+	for idx, evt := range expectedEvents.CommandEvents {
 		switch {
 		case evt.CommandStartedEvent != nil:
 			if len(started) == 0 {
@@ -167,6 +161,16 @@ func verifyCommandEvents(ctx context.Context, client *clientEntity, expectedEven
 			if expected.Command != nil {
 				expectedDoc := documentToRawValue(expected.Command)
 				actualDoc := documentToRawValue(actual.Command)
+
+				// If actual.Command is empty, as is the case with redacted commands,
+				// verifyValuesMatch will return an error from DocumentOK() because
+				// there are not enough bytes to read a document from bson.RawValue{}.
+				// In the case of an empty Command, hardcode an empty bson.RawValue document.
+				if len(actual.Command) == 0 {
+					emptyDoc := []byte{5, 0, 0, 0, 0}
+					actualDoc = bson.RawValue{Type: bsontype.EmbeddedDocument, Value: emptyDoc}
+				}
+
 				if err := verifyValuesMatch(ctx, expectedDoc, actualDoc, true); err != nil {
 					return newEventVerificationError(idx, client, "error comparing command documents: %v", err)
 				}
@@ -174,6 +178,11 @@ func verifyCommandEvents(ctx context.Context, client *clientEntity, expectedEven
 			if expected.HasServiceID != nil {
 				if err := verifyServiceID(*expected.HasServiceID, actual.ServiceID); err != nil {
 					return newEventVerificationError(idx, client, "error verifying serviceID: %v", err)
+				}
+			}
+			if expected.HasServerConnectionID != nil {
+				if err := verifyServerConnectionID(*expected.HasServerConnectionID, actual.ServerConnectionID); err != nil {
+					return newEventVerificationError(idx, client, "error verifying serverConnectionID: %v", err)
 				}
 			}
 		case evt.CommandSucceededEvent != nil:
@@ -192,6 +201,16 @@ func verifyCommandEvents(ctx context.Context, client *clientEntity, expectedEven
 			if expected.Reply != nil {
 				expectedDoc := documentToRawValue(expected.Reply)
 				actualDoc := documentToRawValue(actual.Reply)
+
+				// If actual.Reply is empty, as is the case with redacted replies,
+				// verifyValuesMatch will return an error from DocumentOK() because
+				// there are not enough bytes to read a document from bson.RawValue{}.
+				// In the case of an empty Reply, hardcode an empty bson.RawValue document.
+				if len(actual.Reply) == 0 {
+					emptyDoc := []byte{5, 0, 0, 0, 0}
+					actualDoc = bson.RawValue{Type: bsontype.EmbeddedDocument, Value: emptyDoc}
+				}
+
 				if err := verifyValuesMatch(ctx, expectedDoc, actualDoc, true); err != nil {
 					return newEventVerificationError(idx, client, "error comparing reply documents: %v", err)
 				}
@@ -199,6 +218,11 @@ func verifyCommandEvents(ctx context.Context, client *clientEntity, expectedEven
 			if expected.HasServiceID != nil {
 				if err := verifyServiceID(*expected.HasServiceID, actual.ServiceID); err != nil {
 					return newEventVerificationError(idx, client, "error verifying serviceID: %v", err)
+				}
+			}
+			if expected.HasServerConnectionID != nil {
+				if err := verifyServerConnectionID(*expected.HasServerConnectionID, actual.ServerConnectionID); err != nil {
+					return newEventVerificationError(idx, client, "error verifying serverConnectionID: %v", err)
 				}
 			}
 		case evt.CommandFailedEvent != nil:
@@ -219,25 +243,31 @@ func verifyCommandEvents(ctx context.Context, client *clientEntity, expectedEven
 					return newEventVerificationError(idx, client, "error verifying serviceID: %v", err)
 				}
 			}
+			if expected.HasServerConnectionID != nil {
+				if err := verifyServerConnectionID(*expected.HasServerConnectionID, actual.ServerConnectionID); err != nil {
+					return newEventVerificationError(idx, client, "error verifying serverConnectionID: %v", err)
+				}
+			}
 		default:
 			return newEventVerificationError(idx, client, "no expected event set on commandMonitoringEvent instance")
 		}
 	}
 
-	// Verify that there are no remaining events.
-	if len(started) > 0 || len(succeeded) > 0 || len(failed) > 0 {
+	// Verify that there are no remaining events if IgnoreExtraEvents is unset or false.
+	ignoreExtraEvents := expectedEvents.IgnoreExtraEvents != nil && *expectedEvents.IgnoreExtraEvents
+	if !ignoreExtraEvents && (len(started) > 0 || len(succeeded) > 0 || len(failed) > 0) {
 		return fmt.Errorf("extra events published; all events for client: %s", stringifyEventsForClient(client))
 	}
 	return nil
 }
 
-func verifyCMAPEvents(client *clientEntity, expected []cmapEvent) error {
+func verifyCMAPEvents(client *clientEntity, expectedEvents *expectedEvents) error {
 	pooled := client.poolEvents()
-	if len(expected) == 0 && len(pooled) != 0 {
+	if len(expectedEvents.CMAPEvents) == 0 && len(pooled) != 0 {
 		return fmt.Errorf("expected no cmap events to be sent but got %s", stringifyEventsForClient(client))
 	}
 
-	for idx, evt := range expected {
+	for idx, evt := range expectedEvents.CMAPEvents {
 		var err error
 
 		switch {
@@ -255,13 +285,9 @@ func verifyCMAPEvents(client *clientEntity, expected []cmapEvent) error {
 				return newEventVerificationError(idx, client, err.Error())
 			}
 
-			if reason := evt.ConnectionClosedEvent.Reason; reason != nil {
-				expectedReason, ok := connectionClosedReasons[*reason]
-				if !ok {
-					return newEventVerificationError(idx, client, "unrecognized reason %q", *reason)
-				}
-				if expectedReason != actual.Reason {
-					return newEventVerificationError(idx, client, "expected reason %q, got %q", expectedReason, actual.Reason)
+			if expectedReason := evt.ConnectionClosedEvent.Reason; expectedReason != nil {
+				if *expectedReason != actual.Reason {
+					return newEventVerificationError(idx, client, "expected reason %q, got %q", *expectedReason, actual.Reason)
 				}
 			}
 		case evt.ConnectionCheckedOutEvent != nil:
@@ -274,13 +300,9 @@ func verifyCMAPEvents(client *clientEntity, expected []cmapEvent) error {
 				return newEventVerificationError(idx, client, err.Error())
 			}
 
-			if reason := evt.ConnectionCheckOutFailedEvent.Reason; reason != nil {
-				expectedReason, ok := checkOutFailedReasons[*reason]
-				if !ok {
-					return newEventVerificationError(idx, client, "unrecognized reason %q", *reason)
-				}
-				if expectedReason != actual.Reason {
-					return newEventVerificationError(idx, client, "expected reason %q, got %q", expectedReason, actual.Reason)
+			if expectedReason := evt.ConnectionCheckOutFailedEvent.Reason; expectedReason != nil {
+				if *expectedReason != actual.Reason {
+					return newEventVerificationError(idx, client, "expected reason %q, got %q", *expectedReason, actual.Reason)
 				}
 			}
 		case evt.ConnectionCheckedInEvent != nil:
@@ -302,8 +324,9 @@ func verifyCMAPEvents(client *clientEntity, expected []cmapEvent) error {
 		}
 	}
 
-	// Verify that there are no remaining events.
-	if len(pooled) > 0 {
+	// Verify that there are no remaining events if ignoreExtraEvents is unset or false.
+	ignoreExtraEvents := expectedEvents.IgnoreExtraEvents != nil && *expectedEvents.IgnoreExtraEvents
+	if !ignoreExtraEvents && len(pooled) > 0 {
 		return fmt.Errorf("extra events published; all events for client: %s", stringifyEventsForClient(client))
 	}
 	return nil
@@ -324,6 +347,19 @@ func getNextPoolEvent(events []*event.PoolEvent, expectedType string) (*event.Po
 func verifyServiceID(expectServiceID bool, serviceID *primitive.ObjectID) error {
 	if eventHasID := serviceID != nil; expectServiceID != eventHasID {
 		return fmt.Errorf("expected event to have server ID: %v, event has server ID %v", expectServiceID, serviceID)
+	}
+	return nil
+}
+
+func verifyServerConnectionID(expectedHasSCID bool, scid *int32) error {
+	if actualHasSCID := scid != nil; expectedHasSCID != actualHasSCID {
+		if expectedHasSCID {
+			return fmt.Errorf("expected event to have server connection ID, event has none")
+		}
+		return fmt.Errorf("expected event to have no server connection ID, got %d", *scid)
+	}
+	if expectedHasSCID && *scid <= 0 {
+		return fmt.Errorf("expected event to have a positive server connection ID, got %d", *scid)
 	}
 	return nil
 }

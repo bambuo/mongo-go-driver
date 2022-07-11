@@ -34,8 +34,7 @@ func TestOptionsSetting(t *testing.T) {
 
 	assert.Equal(t, ssts, conf.serverSelectionTimeout)
 
-	serverConf, err := newServerConfig(conf.serverOpts...)
-	assert.Nil(t, err, "error from newServerConfig: %v", err)
+	serverConf := newServerConfig(conf.serverOpts...)
 	assert.Equal(t, name, serverConf.appname, "expected appname to be: %v, got: %v", name, serverConf.appname)
 }
 
@@ -98,12 +97,10 @@ func TestLoadBalancedFromConnString(t *testing.T) {
 			assert.Nil(t, err, "topology.New error: %v", err)
 			assert.Equal(t, tc.loadBalanced, topo.cfg.loadBalanced, "expected loadBalanced %v, got %v", tc.loadBalanced, topo.cfg.loadBalanced)
 
-			srvr, err := NewServer("", topo.id, topo.cfg.serverOpts...)
-			assert.Nil(t, err, "NewServer error: %v", err)
+			srvr := NewServer("", topo.id, topo.cfg.serverOpts...)
 			assert.Equal(t, tc.loadBalanced, srvr.cfg.loadBalanced, "expected loadBalanced %v, got %v", tc.loadBalanced, srvr.cfg.loadBalanced)
 
-			conn, err := newConnection("", srvr.cfg.connectionOpts...)
-			assert.Nil(t, err, "newConnection error: %v", err)
+			conn := newConnection("", srvr.cfg.connectionOpts...)
 			assert.Equal(t, tc.loadBalanced, conn.config.loadBalanced, "expected loadBalanced %v, got %v", tc.loadBalanced, conn.config.loadBalanced)
 		})
 	}

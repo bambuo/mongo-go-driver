@@ -7,7 +7,10 @@
 package integration
 
 import (
+	"context"
+	"fmt"
 	"io/ioutil"
+	"os"
 	"path"
 	"reflect"
 	"strings"
@@ -29,6 +32,7 @@ type crudTestFile struct {
 	Data             []bson.Raw `bson:"data"`
 	MinServerVersion string     `bson:"minServerVersion"`
 	MaxServerVersion string     `bson:"maxServerVersion"`
+	Serverless       string     `bson:"serverless"`
 	Tests            []crudTest `bson:"tests"`
 }
 
@@ -63,6 +67,25 @@ func TestCrudSpec(t *testing.T) {
 	}
 }
 
+func verifyServerlessConstraint(mt *mtest.T, expected string) error {
+	serverless := os.Getenv("SERVERLESS") == "serverless"
+
+	switch expected {
+	case "require":
+		if !serverless {
+			return fmt.Errorf("test requires serverless")
+		}
+	case "forbid":
+		if serverless {
+			return fmt.Errorf("test forbids serverless")
+		}
+	case "allow", "":
+	default:
+		mt.Fatalf("invalid value for serverless: %s", expected)
+	}
+	return nil
+}
+
 func runCrudFile(t *testing.T, file string) {
 	content, err := ioutil.ReadFile(file)
 	assert.Nil(t, err, "ReadFile error for %v: %v", file, err)
@@ -74,6 +97,11 @@ func runCrudFile(t *testing.T, file string) {
 	mt := mtest.New(t, mtest.NewOptions().MinServerVersion(testFile.MinServerVersion).MaxServerVersion(testFile.MaxServerVersion))
 	defer mt.Close()
 
+	// Skip test if serverless requirements are not met.
+	if err = verifyServerlessConstraint(mt, testFile.Serverless); err != nil {
+		mt.Skipf("%v", err)
+	}
+
 	for _, test := range testFile.Tests {
 		mt.Run(test.Description, func(mt *mtest.T) {
 			runCrudTest(mt, test, testFile)
@@ -84,7 +112,7 @@ func runCrudFile(t *testing.T, file string) {
 func runCrudTest(mt *mtest.T, test crudTest, testFile crudTestFile) {
 	if len(testFile.Data) > 0 {
 		docs := rawSliceToInterfaceSlice(testFile.Data)
-		_, err := mt.Coll.InsertMany(mtest.Background, docs)
+		_, err := mt.Coll.InsertMany(context.Background(), docs)
 		assert.Nil(mt, err, "InsertMany error: %v", err)
 	}
 
