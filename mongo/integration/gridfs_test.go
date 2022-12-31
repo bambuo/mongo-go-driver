@@ -18,7 +18,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/event"
-	"go.mongodb.org/mongo-driver/internal/testutil/assert"
+	"go.mongodb.org/mongo-driver/internal/assert"
 	"go.mongodb.org/mongo-driver/internal/testutil/israce"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/gridfs"
@@ -524,6 +524,19 @@ func TestGridFS(x *testing.T) {
 				assert.Equal(mt, p, w.Bytes(), "downloaded file did not match p")
 			})
 		}
+	})
+
+	// Regression test for a bug introduced in GODRIVER-2346.
+	mt.Run("Find", func(mt *mtest.T) {
+		bucket, err := gridfs.NewBucket(mt.DB)
+		assert.Nil(mt, err, "NewBucket error: %v", err)
+		// Find the file back.
+		cursor, err := bucket.Find(bson.D{{"foo", "bar"}})
+		defer func() {
+			_ = cursor.Close(context.Background())
+		}()
+
+		assert.Nil(mt, err, "Find error: %v", err)
 	})
 }
 

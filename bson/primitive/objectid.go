@@ -61,7 +61,9 @@ func (id ObjectID) Timestamp() time.Time {
 
 // Hex returns the hex encoding of the ObjectID as a string.
 func (id ObjectID) Hex() string {
-	return hex.EncodeToString(id[:])
+	var buf [24]byte
+	hex.Encode(buf[:], id[:])
+	return string(buf[:])
 }
 
 func (id ObjectID) String() string {
@@ -80,13 +82,11 @@ func ObjectIDFromHex(s string) (ObjectID, error) {
 		return NilObjectID, ErrInvalidHex
 	}
 
-	b, err := hex.DecodeString(s)
+	var oid [12]byte
+	_, err := hex.Decode(oid[:], []byte(s))
 	if err != nil {
 		return NilObjectID, err
 	}
-
-	var oid [12]byte
-	copy(oid[:], b)
 
 	return oid, nil
 }

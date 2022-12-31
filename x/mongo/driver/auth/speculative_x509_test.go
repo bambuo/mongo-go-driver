@@ -13,7 +13,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/internal"
-	"go.mongodb.org/mongo-driver/internal/testutil/assert"
+	"go.mongodb.org/mongo-driver/internal/assert"
 	"go.mongodb.org/mongo-driver/mongo/address"
 	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/drivertest"
@@ -109,7 +109,7 @@ func TestSpeculativeX509(t *testing.T) {
 		_, err = hello.LookupErr("speculativeAuthenticate")
 		assert.Nil(t, err, "expected command %s to contain 'speculativeAuthenticate'", bson.Raw(hello))
 
-		authenticate, err := drivertest.GetCommandFromQueryWireMessage(<-conn.Written)
+		authenticate, err := drivertest.GetCommandFromMsgWireMessage(<-conn.Written)
 		assert.Nil(t, err, "error parsing authenticate command: %v", err)
 		assertCommandName(t, authenticate, "authenticate")
 	})

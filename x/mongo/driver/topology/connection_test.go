@@ -19,7 +19,8 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"go.mongodb.org/mongo-driver/internal"
-	"go.mongodb.org/mongo-driver/internal/testutil/assert"
+	"go.mongodb.org/mongo-driver/internal/assert"
+	"go.mongodb.org/mongo-driver/internal/testutil/helpers"
 	"go.mongodb.org/mongo-driver/mongo/address"
 	"go.mongodb.org/mongo-driver/mongo/description"
 	"go.mongodb.org/mongo-driver/x/mongo/driver"
@@ -243,7 +244,7 @@ func TestConnection(t *testing.T) {
 
 							connectErr = conn.connect(connectCtx)
 						}
-						assert.Soon(t, callback, tc.maxConnectTime)
+						helpers.AssertSoon(t, callback, tc.maxConnectTime)
 
 						ce, ok := connectErr.(ConnectionError)
 						assert.True(t, ok, "expected error %v to be of type %T", connectErr, ConnectionError{})
@@ -278,7 +279,7 @@ func TestConnection(t *testing.T) {
 
 							connectErr = conn.connect(connectCtx)
 						}
-						assert.Soon(t, callback, tc.maxConnectTime)
+						helpers.AssertSoon(t, callback, tc.maxConnectTime)
 
 						ce, ok := connectErr.(ConnectionError)
 						assert.True(t, ok, "expected error %v to be of type %T", connectErr, ConnectionError{})
@@ -347,16 +348,6 @@ func TestConnection(t *testing.T) {
 				conn := &connection{id: "foobar"}
 				want := ConnectionError{ConnectionID: "foobar", message: "connection is closed"}
 				got := conn.writeWireMessage(context.Background(), []byte{})
-				if !cmp.Equal(got, want, cmp.Comparer(compareErrors)) {
-					t.Errorf("errors do not match. got %v; want %v", got, want)
-				}
-			})
-			t.Run("completed context", func(t *testing.T) {
-				ctx, cancel := context.WithCancel(context.Background())
-				cancel()
-				conn := &connection{id: "foobar", nc: &net.TCPConn{}, state: connConnected}
-				want := ConnectionError{ConnectionID: "foobar", Wrapped: ctx.Err(), message: "failed to write"}
-				got := conn.writeWireMessage(ctx, []byte{})
 				if !cmp.Equal(got, want, cmp.Comparer(compareErrors)) {
 					t.Errorf("errors do not match. got %v; want %v", got, want)
 				}
@@ -486,16 +477,6 @@ func TestConnection(t *testing.T) {
 				conn := &connection{id: "foobar"}
 				want := ConnectionError{ConnectionID: "foobar", message: "connection is closed"}
 				_, got := conn.readWireMessage(context.Background(), []byte{})
-				if !cmp.Equal(got, want, cmp.Comparer(compareErrors)) {
-					t.Errorf("errors do not match. got %v; want %v", got, want)
-				}
-			})
-			t.Run("completed context", func(t *testing.T) {
-				ctx, cancel := context.WithCancel(context.Background())
-				cancel()
-				conn := &connection{id: "foobar", nc: &net.TCPConn{}, state: connConnected}
-				want := ConnectionError{ConnectionID: "foobar", Wrapped: ctx.Err(), message: "failed to read"}
-				_, got := conn.readWireMessage(ctx, []byte{})
 				if !cmp.Equal(got, want, cmp.Comparer(compareErrors)) {
 					t.Errorf("errors do not match. got %v; want %v", got, want)
 				}

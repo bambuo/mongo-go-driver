@@ -77,6 +77,7 @@ func (c *Command) Execute(ctx context.Context) error {
 		return errors.New("the Command operation must have a Deployment set before Execute can be called")
 	}
 
+	// TODO(GODRIVER-2649): Actually pass readConcern to underlying driver.Operation.
 	return driver.Operation{
 		CommandFn: func(dst []byte, desc description.SelectedServer) ([]byte, error) {
 			return append(dst, c.command[4:len(c.command)-1]...), nil
@@ -106,7 +107,7 @@ func (c *Command) Execute(ctx context.Context) error {
 		Crypt:          c.crypt,
 		ServerAPI:      c.serverAPI,
 		Timeout:        c.timeout,
-	}.Execute(ctx, nil)
+	}.Execute(ctx)
 }
 
 // Session sets the session for this operation.

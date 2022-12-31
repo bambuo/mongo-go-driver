@@ -17,7 +17,8 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/internal/testutil/assert"
+	"go.mongodb.org/mongo-driver/internal/assert"
+	"go.mongodb.org/mongo-driver/internal/testutil/helpers"
 	"go.mongodb.org/mongo-driver/internal/testutil/monitor"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/integration/mtest"
@@ -51,7 +52,7 @@ func TestSDAMErrorHandling(t *testing.T) {
 		mt.RunOpts("network errors", noClientOpts, func(mt *mtest.T) {
 			mt.Run("pool cleared on network timeout", func(mt *mtest.T) {
 				// Assert that the pool is cleared when a connection created by an application
-				// operation thread encounters a timeout caused by connectTimeoutMS during
+				// operation thread encounters a timeout caused by socketTimeoutMS during
 				// handshaking.
 
 				appName := "authConnectTimeoutTest"
@@ -85,7 +86,23 @@ func TestSDAMErrorHandling(t *testing.T) {
 				assert.NotNil(mt, err, "expected InsertOne error, got nil")
 				assert.True(mt, mongo.IsTimeout(err), "expected timeout error, got %v", err)
 				assert.True(mt, mongo.IsNetworkError(err), "expected network error, got %v", err)
-				assert.True(mt, tpm.IsPoolCleared(), "expected pool to be cleared but was not")
+				// Assert that the pool is cleared within 2 seconds.
+				helpers.AssertSoon(mt, func(ctx context.Context) {
+					ticker := time.NewTicker(100 * time.Millisecond)
+					defer ticker.Stop()
+
+					for {
+						select {
+						case <-ticker.C:
+						case <-ctx.Done():
+							return
+						}
+
+						if tpm.IsPoolCleared() {
+							return
+						}
+					}
+				}, 2*time.Second)
 			})
 
 			mt.RunOpts("pool cleared on non-timeout network error", noClientOpts, func(mt *mtest.T) {
@@ -114,9 +131,23 @@ func TestSDAMErrorHandling(t *testing.T) {
 						// Set minPoolSize to enable the background pool maintenance goroutine.
 						SetMinPoolSize(5))
 
-					time.Sleep(200 * time.Millisecond)
+					// Assert that the pool is cleared within 2 seconds.
+					helpers.AssertSoon(mt, func(ctx context.Context) {
+						ticker := time.NewTicker(100 * time.Millisecond)
+						defer ticker.Stop()
 
-					assert.True(mt, tpm.IsPoolCleared(), "expected pool to be cleared but was not")
+						for {
+							select {
+							case <-ticker.C:
+							case <-ctx.Done():
+								return
+							}
+
+							if tpm.IsPoolCleared() {
+								return
+							}
+						}
+					}, 2*time.Second)
 				})
 
 				mt.Run("foreground", func(mt *mtest.T) {
@@ -143,7 +174,24 @@ func TestSDAMErrorHandling(t *testing.T) {
 					_, err := mt.Coll.InsertOne(context.Background(), bson.D{{"x", 1}})
 					assert.NotNil(mt, err, "expected InsertOne error, got nil")
 					assert.False(mt, mongo.IsTimeout(err), "expected non-timeout error, got %v", err)
-					assert.True(mt, tpm.IsPoolCleared(), "expected pool to be cleared but was not")
+
+					// Assert that the pool is cleared within 2 seconds.
+					helpers.AssertSoon(mt, func(ctx context.Context) {
+						ticker := time.NewTicker(100 * time.Millisecond)
+						defer ticker.Stop()
+
+						for {
+							select {
+							case <-ticker.C:
+							case <-ctx.Done():
+								return
+							}
+
+							if tpm.IsPoolCleared() {
+								return
+							}
+						}
+					}, 2*time.Second)
 				})
 			})
 		})

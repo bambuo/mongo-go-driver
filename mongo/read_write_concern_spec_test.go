@@ -16,7 +16,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/bsontype"
-	"go.mongodb.org/mongo-driver/internal/testutil/assert"
+	"go.mongodb.org/mongo-driver/internal/assert"
 	"go.mongodb.org/mongo-driver/mongo/readconcern"
 	"go.mongodb.org/mongo-driver/mongo/writeconcern"
 	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	readWriteConcernTestsDir = "../data/read-write-concern"
+	readWriteConcernTestsDir = "../testdata/read-write-concern"
 	connstringTestsDir       = "connection-string"
 	documentTestsDir         = "document"
 )

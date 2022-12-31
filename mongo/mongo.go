@@ -16,7 +16,6 @@ import (
 	"strings"
 
 	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/x/bsonx"
 	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -65,11 +64,10 @@ func (me MarshalError) Error() string {
 //
 // Example usage:
 //
-//		mongo.Pipeline{
-//			{{"$group", bson.D{{"_id", "$state"}, {"totalPop", bson.D{{"$sum", "$pop"}}}}}},
-//			{{"$match", bson.D{{"totalPop", bson.D{{"$gte", 10*1000*1000}}}}}},
-//		}
-//
+//	mongo.Pipeline{
+//		{{"$group", bson.D{{"_id", "$state"}, {"totalPop", bson.D{{"$sum", "$pop"}}}}}},
+//		{{"$match", bson.D{{"totalPop", bson.D{{"$gte", 10*1000*1000}}}}}},
+//	}
 type Pipeline []bson.D
 
 // transformAndEnsureID is a hack that makes it easy to get a RawValue as the _id value.
@@ -81,8 +79,6 @@ func transformAndEnsureID(registry *bsoncodec.Registry, val interface{}) (bsonco
 	switch tt := val.(type) {
 	case nil:
 		return nil, nil, ErrNilDocument
-	case bsonx.Doc:
-		val = tt.Copy()
 	case []byte:
 		// Slight optimization so we'll just use MarshalBSON and not go through the codec machinery.
 		val = bson.Raw(tt)
@@ -265,7 +261,7 @@ func transformUpdateValue(registry *bsoncodec.Registry, update interface{}, doll
 	switch t := update.(type) {
 	case nil:
 		return u, ErrNilDocument
-	case primitive.D, bsonx.Doc:
+	case primitive.D:
 		u.Type = bsontype.EmbeddedDocument
 		u.Data, err = transformBsoncoreDocument(registry, update, true, "update")
 		if err != nil {

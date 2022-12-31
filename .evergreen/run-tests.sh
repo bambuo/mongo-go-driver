@@ -20,7 +20,7 @@ export LD_LIBRARY_PATH=$(pwd)/install/libmongocrypt/lib
 export GOFLAGS=-mod=vendor
 
 SSL=${SSL:-nossl}
-if [ "$SSL" != "nossl" ]; then
+if [ "$SSL" != "nossl" -a -z "${SERVERLESS+x}" ]; then
     export MONGO_GO_DRIVER_CA_FILE="${DRIVERS_TOOLS}/.evergreen/x509gen/ca.pem"
     export MONGO_GO_DRIVER_KEY_FILE="${DRIVERS_TOOLS}/.evergreen/x509gen/client.pem"
     export MONGO_GO_DRIVER_PKCS8_ENCRYPTED_KEY_FILE="${DRIVERS_TOOLS}/.evergreen/x509gen/client-pkcs8-encrypted.pem"
@@ -69,33 +69,6 @@ if [ -z ${GO_BUILD_TAGS+x} ]; then
   GO_BUILD_TAGS="cse"
 fi
 
-# If the task doesn't have the SKIP_CRYPT_SHARED_LIB_DOWNLOAD variable set, try to find the
-# crypt_shared library downloaded in the "prepare-resources" task and set the CRYPT_SHARED_LIB_PATH
-# environment variable with a path to the file.
-if [ "${SKIP_CRYPT_SHARED_LIB_DOWNLOAD}" != "true" ]; then
-  # Find the crypt_shared library file in the current directory and set the CRYPT_SHARED_LIB_PATH to
-  # the path of that file. Only look for .so, .dll, or .dylib files to prevent matching any other
-  # downloaded files.
-  export CRYPT_SHARED_LIB_PATH="$(find $(pwd) -maxdepth 1 -type f \
-    -name 'mongo_crypt_v1.so' -o \
-    -name 'mongo_crypt_v1.dll' -o \
-    -name 'mongo_crypt_v1.dylib')"
-
-  # Expect that we always find a crypt_shared library file and set the CRYPT_SHARED_LIB_PATH
-  # environment variable. If we didn't, print an error message and exit.
-  if [ -z "$CRYPT_SHARED_LIB_PATH" ]; then
-    echo 'SKIP_CRYPT_SHARED_LIB_DOWNLOAD is not "true", but CRYPT_SHARED_LIB_PATH is empty. Exiting.'
-    exit 1
-  fi
-
-  # If we're on Windows, convert the "cygdrive"  path to Windows-style paths.
-  if [ "Windows_NT" = "$OS" ]; then
-      export CRYPT_SHARED_LIB_PATH=$(cygpath -m $CRYPT_SHARED_LIB_PATH)
-  fi
-
-  echo "CRYPT_SHARED_LIB_PATH=$CRYPT_SHARED_LIB_PATH"
-fi
-
 # Ensure mock KMS servers are running before starting tests.
 await_server() {
   for i in $(seq 300); do
@@ -113,6 +86,28 @@ await_server "KMS", 5698
 
 echo "finished awaiting servers"
 
+if [ "${SKIP_CRYPT_SHARED_LIB}" = "true" ]; then
+  CRYPT_SHARED_LIB_PATH=""
+  echo "crypt_shared library is skipped"
+elif [ -z "${CRYPT_SHARED_LIB_PATH}" ]; then
+  echo "crypt_shared library path is empty"
+else
+  CRYPT_SHARED_LIB_PATH=${CRYPT_SHARED_LIB_PATH}
+  echo "crypt_shared library will be loaded from path: $CRYPT_SHARED_LIB_PATH"
+fi
+
+CSFLE_TLS_CA_FILE="$(pwd)/testdata/kmip-certs/ca-ec.pem"
+CSFLE_TLS_CERTIFICATE_KEY_FILE="$(pwd)/testdata/kmip-certs/client-ec.pem"
+
+if [ "Windows_NT" = "$OS" ]; then
+  CSFLE_TLS_CA_FILE=$(cygpath -m $CSFLE_TLS_CA_FILE)
+  CSFLE_TLS_CERTIFICATE_KEY_FILE=$(cygpath -m $CSFLE_TLS_CERTIFICATE_KEY_FILE)
+fi
+
+if [ -z ${MAKEFILE_TARGET+x} ]; then
+  MAKEFILE_TARGET="evg-test"
+fi
+
 AUTH=${AUTH} \
 SSL=${SSL} \
 MONGO_GO_DRIVER_CA_FILE=${MONGO_GO_DRIVER_CA_FILE} \
@@ -122,7 +117,7 @@ MONGO_GO_DRIVER_PKCS8_UNENCRYPTED_KEY_FILE=${MONGO_GO_DRIVER_PKCS8_UNENCRYPTED_K
 MONGODB_URI="${MONGODB_URI}" \
 TOPOLOGY=${TOPOLOGY} \
 MONGO_GO_DRIVER_COMPRESSOR=${MONGO_GO_DRIVER_COMPRESSOR} \
-BUILD_TAGS="-tags ${GO_BUILD_TAGS}" \
+BUILD_TAGS="${RACE} -tags ${GO_BUILD_TAGS}" \
 AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}" \
 AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}" \
 AWS_DEFAULT_REGION="us-east-1" \
@@ -134,8 +129,9 @@ AZURE_CLIENT_ID="${cse_azure_client_id}" \
 AZURE_CLIENT_SECRET="${cse_azure_client_secret}" \
 GCP_EMAIL="${cse_gcp_email}" \
 GCP_PRIVATE_KEY="${cse_gcp_private_key}" \
-CSFLE_TLS_CA_FILE="$DRIVERS_TOOLS/.evergreen/x509gen/ca.pem" \
-CSFLE_TLS_CERTIFICATE_KEY_FILE="$DRIVERS_TOOLS/.evergreen/x509gen/client.pem" \
-make evg-test \
+CSFLE_TLS_CA_FILE="$CSFLE_TLS_CA_FILE" \
+CSFLE_TLS_CERTIFICATE_KEY_FILE="$CSFLE_TLS_CERTIFICATE_KEY_FILE" \
+CRYPT_SHARED_LIB_PATH=$CRYPT_SHARED_LIB_PATH \
+make $MAKEFILE_TARGET \
 PKG_CONFIG_PATH=$PKG_CONFIG_PATH \
 LD_LIBRARY_PATH=$LD_LIBRARY_PATH

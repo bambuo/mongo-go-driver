@@ -12,11 +12,11 @@ import (
 	"testing"
 
 	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/internal/testutil/assert"
+	"go.mongodb.org/mongo-driver/internal/assert"
 	"go.mongodb.org/mongo-driver/mongo/integration/mtest"
 )
 
-const retryableWritesTestDir = "../../data/retryable-writes/legacy"
+const retryableWritesTestDir = "../../testdata/retryable-writes/legacy"
 
 type retryableWritesTestFile struct {
 	RunOn []mtest.RunOnBlock    `bson:"runOn"`

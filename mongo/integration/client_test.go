@@ -22,8 +22,9 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/event"
 	"go.mongodb.org/mongo-driver/internal"
+	"go.mongodb.org/mongo-driver/internal/assert"
 	"go.mongodb.org/mongo-driver/internal/testutil"
-	"go.mongodb.org/mongo-driver/internal/testutil/assert"
+	"go.mongodb.org/mongo-driver/internal/testutil/helpers"
 	"go.mongodb.org/mongo-driver/internal/testutil/monitor"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/integration/mtest"
@@ -515,6 +516,8 @@ func TestClient(t *testing.T) {
 	})
 
 	mt.Run("minimum RTT is monitored", func(mt *mtest.T) {
+		mt.Parallel()
+
 		// Reset the client with a dialer that delays all network round trips by 300ms and set the
 		// heartbeat interval to 100ms to reduce the time it takes to collect RTT samples.
 		mt.ResetClient(options.Client().
@@ -523,7 +526,7 @@ func TestClient(t *testing.T) {
 
 		// Assert that the minimum RTT is eventually >250ms.
 		topo := getTopologyFromClient(mt.Client)
-		assert.Soon(mt, func(ctx context.Context) {
+		helpers.AssertSoon(mt, func(ctx context.Context) {
 			for {
 				// Stop loop if callback has been canceled.
 				select {
@@ -539,7 +542,7 @@ func TestClient(t *testing.T) {
 				for _, desc := range topo.Description().Servers {
 					server, err := topo.FindServer(desc)
 					assert.Nil(mt, err, "FindServer error: %v", err)
-					if server.MinRTT() <= 250*time.Millisecond {
+					if server.RTTMonitor().Min() <= 250*time.Millisecond {
 						done = false
 					}
 				}
@@ -553,6 +556,8 @@ func TestClient(t *testing.T) {
 	// Test that if the minimum RTT is greater than the remaining timeout for an operation, the
 	// operation is not sent to the server and no connections are closed.
 	mt.Run("minimum RTT used to prevent sending requests", func(mt *mtest.T) {
+		mt.Parallel()
+
 		// Assert that we can call Ping with a 250ms timeout.
 		ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 		defer cancel()
@@ -569,7 +574,7 @@ func TestClient(t *testing.T) {
 
 		// Assert that the minimum RTT is eventually >250ms.
 		topo := getTopologyFromClient(mt.Client)
-		assert.Soon(mt, func(ctx context.Context) {
+		helpers.AssertSoon(mt, func(ctx context.Context) {
 			for {
 				// Stop loop if callback has been canceled.
 				select {
@@ -585,7 +590,7 @@ func TestClient(t *testing.T) {
 				for _, desc := range topo.Description().Servers {
 					server, err := topo.FindServer(desc)
 					assert.Nil(mt, err, "FindServer error: %v", err)
-					if server.MinRTT() <= 250*time.Millisecond {
+					if server.RTTMonitor().Min() <= 250*time.Millisecond {
 						done = false
 					}
 				}
@@ -610,9 +615,7 @@ func TestClient(t *testing.T) {
 	})
 
 	mt.Run("RTT90 is monitored", func(mt *mtest.T) {
-		if testing.Short() {
-			t.Skip("skipping integration test in short mode")
-		}
+		mt.Parallel()
 
 		// Reset the client with a dialer that delays all network round trips by 300ms and set the
 		// heartbeat interval to 100ms to reduce the time it takes to collect RTT samples.
@@ -622,7 +625,7 @@ func TestClient(t *testing.T) {
 
 		// Assert that RTT90s are eventually >300ms.
 		topo := getTopologyFromClient(mt.Client)
-		assert.Soon(mt, func(ctx context.Context) {
+		helpers.AssertSoon(mt, func(ctx context.Context) {
 			for {
 				// Stop loop if callback has been canceled.
 				select {
@@ -638,7 +641,7 @@ func TestClient(t *testing.T) {
 				for _, desc := range topo.Description().Servers {
 					server, err := topo.FindServer(desc)
 					assert.Nil(mt, err, "FindServer error: %v", err)
-					if server.RTT90() <= 300*time.Millisecond {
+					if server.RTTMonitor().P90() <= 300*time.Millisecond {
 						done = false
 					}
 				}
@@ -652,9 +655,7 @@ func TestClient(t *testing.T) {
 	// Test that if Timeout is set and the RTT90 is greater than the remaining timeout for an operation, the
 	// operation is not sent to the server, fails with a timeout error, and no connections are closed.
 	mt.Run("RTT90 used to prevent sending requests", func(mt *mtest.T) {
-		if testing.Short() {
-			t.Skip("skipping integration test in short mode")
-		}
+		mt.Parallel()
 
 		// Assert that we can call Ping with a 250ms timeout.
 		ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
@@ -673,9 +674,9 @@ func TestClient(t *testing.T) {
 			SetHeartbeatInterval(reducedHeartbeatInterval).
 			SetTimeout(0))
 
-		// Assert that RTT90s are eventually >300ms.
+		// Assert that RTT90s are eventually >275ms.
 		topo := getTopologyFromClient(mt.Client)
-		assert.Soon(mt, func(ctx context.Context) {
+		helpers.AssertSoon(mt, func(ctx context.Context) {
 			for {
 				// Stop loop if callback has been canceled.
 				select {
@@ -686,12 +687,12 @@ func TestClient(t *testing.T) {
 
 				time.Sleep(100 * time.Millisecond)
 
-				// Wait for all of the server's RTT90s to be >300ms.
+				// Wait for all of the server's RTT90s to be >275ms.
 				done := true
 				for _, desc := range topo.Description().Servers {
 					server, err := topo.FindServer(desc)
 					assert.Nil(mt, err, "FindServer error: %v", err)
-					if server.RTT90() <= 300*time.Millisecond {
+					if server.RTTMonitor().P90() <= 275*time.Millisecond {
 						done = false
 					}
 				}
@@ -701,10 +702,10 @@ func TestClient(t *testing.T) {
 			}
 		}, 10*time.Second)
 
-		// Once we've waited for the RTT90 for the servers to be >300ms, run 10 Ping operations
-		// with a timeout of 300ms and expect that they return timeout errors.
+		// Once we've waited for the RTT90 for the servers to be >275ms, run 10 Ping operations
+		// with a timeout of 275ms and expect that they return timeout errors.
 		for i := 0; i < 10; i++ {
-			ctx, cancel = context.WithTimeout(context.Background(), 300*time.Millisecond)
+			ctx, cancel = context.WithTimeout(context.Background(), 275*time.Millisecond)
 			err := mt.Client.Ping(ctx, nil)
 			cancel()
 			assert.NotNil(mt, err, "expected Ping to return an error")
@@ -792,12 +793,16 @@ func TestClient(t *testing.T) {
 }
 
 func TestClientStress(t *testing.T) {
+	t.Parallel()
+
 	mtOpts := mtest.NewOptions().CreateClient(false)
 	mt := mtest.New(t, mtOpts)
 	defer mt.Close()
 
 	// Test that a Client can recover from a massive traffic spike after the traffic spike is over.
 	mt.Run("Client recovers from traffic spike", func(mt *mtest.T) {
+		mt.Parallel()
+
 		oid := primitive.NewObjectID()
 		doc := bson.D{{Key: "_id", Value: oid}, {Key: "key", Value: "value"}}
 		_, err := mt.Coll.InsertOne(context.Background(), doc)
@@ -852,6 +857,8 @@ func TestClientStress(t *testing.T) {
 					SetPoolMonitor(tpm.PoolMonitor).
 					SetMaxPoolSize(maxPoolSize))
 			mt.RunOpts(fmt.Sprintf("maxPoolSize %d", maxPoolSize), maxPoolSizeOpt, func(mt *mtest.T) {
+				mt.Parallel()
+
 				// Print the count of connection created, connection closed, and pool clear events
 				// collected during the test to help with debugging.
 				defer func() {

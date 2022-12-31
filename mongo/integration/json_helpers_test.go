@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/internal/testutil/assert"
+	"go.mongodb.org/mongo-driver/internal/assert"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readconcern"
@@ -452,29 +452,6 @@ func readPrefFromString(s string) *readpref.ReadPref {
 func createReadPref(opt bson.RawValue) *readpref.ReadPref {
 	mode := opt.Document().Lookup("mode").StringValue()
 	return readPrefFromString(mode)
-}
-
-// transform a slice of BSON documents to a slice of interface{}.
-func rawSliceToInterfaceSlice(docs []bson.Raw) []interface{} {
-	out := make([]interface{}, len(docs))
-
-	for i, doc := range docs {
-		out[i] = doc
-	}
-
-	return out
-}
-
-// transform a BSON raw array to a slice of interface{}.
-func rawArrayToInterfaceSlice(docs bson.Raw) []interface{} {
-	vals, _ := docs.Values()
-
-	out := make([]interface{}, len(vals))
-	for i, val := range vals {
-		out[i] = val.Document()
-	}
-
-	return out
 }
 
 // retrieve the error associated with a result.

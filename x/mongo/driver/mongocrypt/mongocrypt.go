@@ -16,17 +16,29 @@ package mongocrypt
 // #include <stdlib.h>
 import "C"
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"unsafe"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/internal"
 	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/auth/creds"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/mongocrypt/options"
 )
 
 type MongoCrypt struct {
-	wrapped *C.mongocrypt_t
+	wrapped      *C.mongocrypt_t
+	kmsProviders bsoncore.Document
+}
+
+// Version returns the version string for the loaded libmongocrypt, or an empty string
+// if libmongocrypt was not loaded.
+func Version() string {
+	str := C.GoString(C.mongocrypt_version(nil))
+	return str
 }
 
 // NewMongoCrypt constructs a new MongoCrypt instance configured using the provided MongoCryptOptions.
@@ -37,7 +49,8 @@ func NewMongoCrypt(opts *options.MongoCryptOptions) (*MongoCrypt, error) {
 		return nil, errors.New("could not create new mongocrypt object")
 	}
 	crypt := &MongoCrypt{
-		wrapped: wrapped,
+		wrapped:      wrapped,
+		kmsProviders: opts.KmsProviders,
 	}
 
 	// set options in mongocrypt
@@ -68,6 +81,8 @@ func NewMongoCrypt(opts *options.MongoCryptOptions) (*MongoCrypt, error) {
 			C.mongocrypt_setopt_set_crypt_shared_lib_path_override(crypt.wrapped, cryptSharedLibOverridePathStr)
 		}
 	}
+
+	C.mongocrypt_setopt_use_need_kms_credentials_state(crypt.wrapped)
 
 	// initialize handle
 	if !C.mongocrypt_init(crypt.wrapped) {
@@ -211,9 +226,8 @@ const (
 	IndexTypeIndexed   = 2
 )
 
-// CreateExplicitEncryptionContext creates a Context to use for explicit encryption.
-func (m *MongoCrypt) CreateExplicitEncryptionContext(doc bsoncore.Document, opts *options.ExplicitEncryptionOptions) (*Context, error) {
-
+// createExplicitEncryptionContext creates an explicit encryption context.
+func (m *MongoCrypt) createExplicitEncryptionContext(opts *options.ExplicitEncryptionOptions) (*Context, error) {
 	ctx := newContext(C.mongocrypt_ctx_new(m.wrapped))
 	if ctx.wrapped == nil {
 		return nil, m.createErrorFromStatus()
@@ -230,6 +244,32 @@ func (m *MongoCrypt) CreateExplicitEncryptionContext(doc bsoncore.Document, opts
 	if opts.KeyAltName != nil {
 		if err := setAltName(ctx, *opts.KeyAltName); err != nil {
 			return nil, err
+		}
+	}
+
+	if opts.RangeOptions != nil {
+		idx, mongocryptDoc := bsoncore.AppendDocumentStart(nil)
+		if opts.RangeOptions.Min != nil {
+			mongocryptDoc = bsoncore.AppendValueElement(mongocryptDoc, "min", *opts.RangeOptions.Min)
+		}
+		if opts.RangeOptions.Max != nil {
+			mongocryptDoc = bsoncore.AppendValueElement(mongocryptDoc, "max", *opts.RangeOptions.Max)
+		}
+		if opts.RangeOptions.Precision != nil {
+			mongocryptDoc = bsoncore.AppendInt32Element(mongocryptDoc, "precision", *opts.RangeOptions.Precision)
+		}
+		mongocryptDoc = bsoncore.AppendInt64Element(mongocryptDoc, "sparsity", opts.RangeOptions.Sparsity)
+
+		mongocryptDoc, err := bsoncore.AppendDocumentEnd(mongocryptDoc, idx)
+		if err != nil {
+			return nil, err
+		}
+
+		mongocryptBinary := newBinaryFromBytes(mongocryptDoc)
+		defer mongocryptBinary.close()
+
+		if ok := C.mongocrypt_ctx_setopt_algorithm_range(ctx.wrapped, mongocryptBinary.wrapped); !ok {
+			return nil, ctx.createErrorFromStatus()
 		}
 	}
 
@@ -253,10 +293,33 @@ func (m *MongoCrypt) CreateExplicitEncryptionContext(doc bsoncore.Document, opts
 			return nil, ctx.createErrorFromStatus()
 		}
 	}
+	return ctx, nil
+}
 
+// CreateExplicitEncryptionContext creates a Context to use for explicit encryption.
+func (m *MongoCrypt) CreateExplicitEncryptionContext(doc bsoncore.Document, opts *options.ExplicitEncryptionOptions) (*Context, error) {
+	ctx, err := m.createExplicitEncryptionContext(opts)
+	if err != nil {
+		return ctx, err
+	}
 	docBinary := newBinaryFromBytes(doc)
 	defer docBinary.close()
 	if ok := C.mongocrypt_ctx_explicit_encrypt_init(ctx.wrapped, docBinary.wrapped); !ok {
+		return nil, ctx.createErrorFromStatus()
+	}
+
+	return ctx, nil
+}
+
+// CreateExplicitEncryptionExpressionContext creates a Context to use for explicit encryption of an expression.
+func (m *MongoCrypt) CreateExplicitEncryptionExpressionContext(doc bsoncore.Document, opts *options.ExplicitEncryptionOptions) (*Context, error) {
+	ctx, err := m.createExplicitEncryptionContext(opts)
+	if err != nil {
+		return ctx, err
+	}
+	docBinary := newBinaryFromBytes(doc)
+	defer docBinary.close()
+	if ok := C.mongocrypt_ctx_explicit_encrypt_expression_init(ctx.wrapped, docBinary.wrapped); !ok {
 		return nil, ctx.createErrorFromStatus()
 	}
 
@@ -397,4 +460,51 @@ func (m *MongoCrypt) createErrorFromStatus() error {
 	defer C.mongocrypt_status_destroy(status)
 	C.mongocrypt_status(m.wrapped, status)
 	return errorFromStatus(status)
+}
+
+// needsKmsProvider returns true if provider was initially set to an empty document.
+// An empty document signals the driver to fetch credentials.
+func needsKmsProvider(kmsProviders bsoncore.Document, provider string) bool {
+	val, err := kmsProviders.LookupErr(provider)
+	if err != nil {
+		// KMS provider is not configured.
+		return false
+	}
+	doc, ok := val.DocumentOK()
+	// KMS provider is an empty document if the length is 5.
+	// An empty document contains 4 bytes of "\x00" and a null byte.
+	return ok && len(doc) == 5
+}
+
+// GetKmsProviders returns the originally configured KMS providers.
+func (m *MongoCrypt) GetKmsProviders(ctx context.Context, httpClient *http.Client) (bsoncore.Document, error) {
+	builder := bsoncore.NewDocumentBuilder()
+
+	if needsKmsProvider(m.kmsProviders, "gcp") {
+		// "gcp" KMS provider is an empty document.
+		// Attempt to fetch from GCP Instance Metadata server.
+		p := creds.GcpCredentialProvider{HTTPClient: httpClient}
+		token, err := p.GetCredentials(ctx)
+		if err != nil {
+			return nil, err
+		}
+		builder.StartDocument("gcp").
+			AppendString("accessToken", token).
+			FinishDocument()
+	}
+	if needsKmsProvider(m.kmsProviders, "aws") {
+		p := creds.AwsCredentialProvider{HTTPClient: httpClient}
+		provider, err := p.GetCredentials(ctx)
+		if err != nil {
+			return nil, internal.WrapErrorf(err, "unable to retrieve AWS credentials")
+		}
+		builder.StartDocument("aws").
+			AppendString("accessKeyId", provider.Value.AccessKeyID).
+			AppendString("secretAccessKey", provider.Value.SecretAccessKey)
+		if len(provider.Value.SessionToken) > 0 {
+			builder.AppendString("sessionToken", provider.Value.SessionToken)
+		}
+		builder.FinishDocument()
+	}
+	return builder.Build(), nil
 }

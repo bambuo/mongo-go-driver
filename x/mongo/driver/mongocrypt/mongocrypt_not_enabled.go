@@ -10,6 +10,9 @@
 package mongocrypt
 
 import (
+	"context"
+	"net/http"
+
 	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/mongocrypt/options"
 )
@@ -19,6 +22,12 @@ const cseNotSupportedMsg = "client-side encryption not enabled. add the cse buil
 // MongoCrypt represents a mongocrypt_t handle.
 type MongoCrypt struct{}
 
+// Version returns the version string for the loaded libmongocrypt, or an empty string
+// if libmongocrypt was not loaded.
+func Version() string {
+	return ""
+}
+
 // NewMongoCrypt constructs a new MongoCrypt instance configured using the provided MongoCryptOptions.
 func NewMongoCrypt(opts *options.MongoCryptOptions) (*MongoCrypt, error) {
 	panic(cseNotSupportedMsg)
@@ -26,6 +35,11 @@ func NewMongoCrypt(opts *options.MongoCryptOptions) (*MongoCrypt, error) {
 
 // CreateEncryptionContext creates a Context to use for encryption.
 func (m *MongoCrypt) CreateEncryptionContext(db string, cmd bsoncore.Document) (*Context, error) {
+	panic(cseNotSupportedMsg)
+}
+
+// CreateExplicitEncryptionExpressionContext creates a Context to use for explicit encryption of an expression.
+func (m *MongoCrypt) CreateExplicitEncryptionExpressionContext(doc bsoncore.Document, opts *options.ExplicitEncryptionOptions) (*Context, error) {
 	panic(cseNotSupportedMsg)
 }
 
@@ -68,5 +82,10 @@ func (m *MongoCrypt) CryptSharedLibVersionString() string {
 
 // Close cleans up any resources associated with the given MongoCrypt instance.
 func (m *MongoCrypt) Close() {
+	panic(cseNotSupportedMsg)
+}
+
+// GetKmsProviders returns the originally configured KMS providers.
+func (m *MongoCrypt) GetKmsProviders(ctx context.Context, httpClient *http.Client) (bsoncore.Document, error) {
 	panic(cseNotSupportedMsg)
 }

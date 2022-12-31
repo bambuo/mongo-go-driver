@@ -15,9 +15,8 @@ command_type: setup
 # Fail builds when pre tasks fail.
 pre_error_fails_task: true
 
-# Protect ourself against rogue test case, or curl gone wild, that runs forever
-# 12 minutes is the longest we'll ever run
-exec_timeout_secs: 3600 # 12 minutes is the longest we'll ever run
+# Protect the CI from long or indefinite runtimes.
+exec_timeout_secs: 3600
 
 # What to do when evergreen hits the timeout (`post:` tasks are run automatically)
 timeout:
@@ -94,9 +93,8 @@ functions:
           go version
           go env
 
-          LIBMONGOCRYPT_TAG="1.5.0"
-          # LIBMONGOCRYPT_COMMIT is the commit on libmongocrypt for the tag LIBMONGOCRYPT_TAG.
-          LIBMONGOCRYPT_COMMIT="c3be59f9b0d756caa4c22c254e0704084cf6bca4"
+          # TODO(GODRIVER-2676): use libmongocrypt 1.7.0 once it is released.
+          LIBMONGOCRYPT_TAG="1.7.0-alpha1"
           # Install libmongocrypt based on OS.
           if [ "Windows_NT" = "$OS" ]; then
              mkdir -p c:/libmongocrypt/include
@@ -105,6 +103,10 @@ functions:
              mkdir libmongocrypt-all
              cd libmongocrypt-all
              # The following URL is published from the upload-all task in the libmongocrypt Evergreen project.
+             # TODO(GODRIVER-2676): replace this URL once libmongocrypt 1.7.0 is released with the following:
+             # curl https://mciuploads.s3.amazonaws.com/libmongocrypt/all/$LIBMONGOCRYPT_TAG/libmongocrypt-all.tar.gz -o libmongocrypt-all.tar.gz
+             # There is no tag URL for libmongocrypt pre-releases.
+             LIBMONGOCRYPT_COMMIT=2cd2f77ae806a3a4c12750b39b0be92b0ca3b2c1
              curl https://mciuploads.s3.amazonaws.com/libmongocrypt/all/master/$LIBMONGOCRYPT_COMMIT/libmongocrypt-all.tar.gz -o libmongocrypt-all.tar.gz
              tar -xf libmongocrypt-all.tar.gz
              cd ..
@@ -113,24 +115,11 @@ functions:
              export PATH=$PATH:/cygdrive/c/libmongocrypt/bin
              rm -rf libmongocrypt-all
              echo "fetching build for Windows ... end"
-          elif [ "Darwin" = "$(uname -s)" ]; then
-             # TODO (GODRIVER-2442): Once libmongocrypt compiles on macOS 10.15, remove this elif block.
-             echo "fetching build for Darwin ... begin"
-             mkdir -p install/libmongocrypt
-             mkdir libmongocrypt-all
-             cd libmongocrypt-all
-             # The following URL is published from the upload-all task in the libmongocrypt Evergreen project.
-             curl https://mciuploads.s3.amazonaws.com/libmongocrypt/all/master/$LIBMONGOCRYPT_COMMIT/libmongocrypt-all.tar.gz -o libmongocrypt-all.tar.gz
-             tar -xf libmongocrypt-all.tar.gz
-             cd ..
-             mv libmongocrypt-all/macos/include ./install/libmongocrypt
-             mv libmongocrypt-all/macos/lib ./install/libmongocrypt
-             rm -rf libmongocrypt-all
-             # Fix prefix in pkg-config prefix path.
-             sed -i "" -E "s+prefix=.*+prefix=$(pwd)/install/libmongocrypt+" ./install/libmongocrypt/lib/pkgconfig/libmongocrypt.pc
-             echo "fetching build for Darwin ... end"
           else
-            git clone https://github.com/mongodb/libmongocrypt --branch $LIBMONGOCRYPT_TAG
+            git clone https://github.com/mongodb/libmongocrypt
+            cd libmongocrypt
+            git checkout $LIBMONGOCRYPT_TAG
+            cd ..
             ./libmongocrypt/.evergreen/compile.sh
           fi
 
@@ -189,29 +178,19 @@ functions:
     - command: shell.exec
       params:
         working_dir: src/go.mongodb.org/mongo-driver
+        shell: "bash"
         script: |
-          ${PREPARE_SHELL}
+          . ${DRIVERS_TOOLS}/.evergreen/venv-utils.sh
+          . ${DRIVERS_TOOLS}/.evergreen/find-python3.sh
 
-          # Skip the crypt_shared library download if there is no crypt_shared build for the current
-          # platform. Don't try to determine this automatically to prevent misconfiguration errors
-          # from silently skipping the crypt_shared download and changing the testing conditions.
-          if [ "${SKIP_CRYPT_SHARED_LIB_DOWNLOAD}" = "true" ]; then
-            echo "There is no crypt_shared library for this platform, skipping download..."
-            exit 0
-          fi
+          export PYTHON3_BINARY="$(find_python3)"
+          venvcreate "$PYTHON3_BINARY" venv
 
-          # Download the crypt_shared dynamic library for the current platform to the current working
-          # directory. The run-tests.sh and versioned API test scripts expect to find a
-          # mongo_crypt_v1.* file in the "src/go.mongodb.org/mongo-driver" working directory.
-          # TODO(GODRIVER-2437): Update version to "latest-stable" once the crypt_shared library has a
-          # feature-complete stable release.
-          ${PYTHON3_BINARY} $DRIVERS_TOOLS/.evergreen/mongodl.py \
-            --component crypt_shared \
-            --version latest \
-            --edition enterprise \
-            --out . \
-            --only "**/mongo_crypt_v1.*" \
-            --strip-path-components 1
+          echo "PYTHON3_BINARY: $PYTHON3_BINARY" >>expansion.yml
+    # Load the expansion file to make an evergreen variable with the current unique version
+    - command: expansions.update
+      params:
+        file: src/go.mongodb.org/mongo-driver/expansion.yml
 
   install-linters:
     - command: shell.exec
@@ -241,6 +220,16 @@ functions:
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
         display_name: "mongodb-logs.tar.gz"
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: ${PROJECT_DIRECTORY}/fuzz.tgz
+        remote_file: ${UPLOAD_BUCKET}/${build_variant}/${revision}/${version_id}/${build_id}/${task_id}-${execution}-fuzz.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/x-gzip
+        display_name: "fuzz.tgz"
 
   bootstrap-mongohoused:
     - command: shell.exec
@@ -367,7 +356,6 @@ functions:
     - command: shell.exec
       type: test
       params:
-        silent: true
         working_dir: src/go.mongodb.org/mongo-driver
         script: |
           # DO NOT ECHO WITH XTRACE
@@ -382,7 +370,10 @@ functions:
           export GOROOT="${GO_DIST}"
           export GOCACHE="$GOCACHE"
           export PATH="${GCC_PATH}:${GO_DIST}/bin:$PATH"
-          MONGODB_URI="${MONGODB_URI}" MONGO_GO_DRIVER_COMPRESSOR="${MONGO_GO_DRIVER_COMPRESSOR}" make -s evg-test-auth
+          export MONGODB_URI="${MONGODB_URI}"
+          export MONGO_GO_DRIVER_COMPRESSOR="${MONGO_GO_DRIVER_COMPRESSOR}"
+
+          make -s evg-test-enterprise-auth
 
   run-enterprise-gssapi-auth-tests:
     - command: shell.exec
@@ -409,7 +400,9 @@ functions:
           export GOROOT="${GO_DIST}"
           export GOCACHE="$GOCACHE"
           export PATH="${GCC_PATH}:${GO_DIST}/bin:$PATH"
-          MONGO_GO_DRIVER_COMPRESSOR="${MONGO_GO_DRIVER_COMPRESSOR}" make -s evg-test-auth
+          export MONGO_GO_DRIVER_COMPRESSOR="${MONGO_GO_DRIVER_COMPRESSOR}"
+
+          make -s evg-test-enterprise-auth
 
   run-enterprise-gssapi-service-host-auth-tests:
     - command: shell.exec
@@ -436,7 +429,9 @@ functions:
           export GOROOT="${GO_DIST}"
           export GOCACHE="$GOCACHE"
           export PATH="${GCC_PATH}:${GO_DIST}/bin:$PATH"
-          MONGO_GO_DRIVER_COMPRESSOR="${MONGO_GO_DRIVER_COMPRESSOR}" make -s evg-test-auth
+          export MONGO_GO_DRIVER_COMPRESSOR="${MONGO_GO_DRIVER_COMPRESSOR}"
+
+          make -s evg-test-enterprise-auth
 
   run-atlas-test:
     - command: shell.exec
@@ -503,8 +498,8 @@ functions:
           export AWS_DEFAULT_REGION="us-east-1"
 
           # Set client-side encryption credentials.
-          export CSFLE_TLS_CA_FILE="$DRIVERS_TOOLS/.evergreen/x509gen/ca.pem"
-          export CSFLE_TLS_CERTIFICATE_KEY_FILE="$DRIVERS_TOOLS/.evergreen/x509gen/client.pem"
+          export CSFLE_TLS_CA_FILE="$PROJECT_DIRECTORY/testdata/kmip-certs/ca-ec.pem"
+          export CSFLE_TLS_CERTIFICATE_KEY_FILE="$PROJECT_DIRECTORY/testdata/kmip-certs/client-ec.pem"
 
           ${PYTHON3_BINARY} -m venv ./venv
           ./venv/${VENV_BIN_DIR|bin}/pip3 install boto3
@@ -518,31 +513,14 @@ functions:
           fi
           . ${DRIVERS_TOOLS}/.evergreen/csfle/set-temp-creds.sh
 
-          # If the task doesn't have the SKIP_CRYPT_SHARED_LIB_DOWNLOAD variable set, try to find the
-          # crypt_shared library downloaded in the "prepare-resources" task and set the CRYPT_SHARED_LIB_PATH
-          # environment variable with a path to the file.
-          if [ "${SKIP_CRYPT_SHARED_LIB_DOWNLOAD}" != "true" ]; then
-            # Find the crypt_shared library file in the current directory and set the CRYPT_SHARED_LIB_PATH to
-            # the path of that file. Only look for .so, .dll, or .dylib files to prevent matching any other
-            # downloaded files.
-            export CRYPT_SHARED_LIB_PATH="$(find $(pwd) -maxdepth 1 -type f \
-              -name 'mongo_crypt_v1.so' -o \
-              -name 'mongo_crypt_v1.dll' -o \
-              -name 'mongo_crypt_v1.dylib')"
-
-            # Expect that we always find a crypt_shared library file and set the CRYPT_SHARED_LIB_PATH
-            # environment variable. If we didn't, print an error message and exit.
-            if [ -z "$CRYPT_SHARED_LIB_PATH" ]; then
-              echo 'SKIP_CRYPT_SHARED_LIB_DOWNLOAD is not "true", but CRYPT_SHARED_LIB_PATH is empty. Exiting.'
-              exit 1
-            fi
-
-            # If we're on Windows, convert the "cygdrive"  path to Windows-style paths.
-            if [ "Windows_NT" = "$OS" ]; then
-                export CRYPT_SHARED_LIB_PATH=$(cygpath -m $CRYPT_SHARED_LIB_PATH)
-            fi
-
-            echo "CRYPT_SHARED_LIB_PATH=$CRYPT_SHARED_LIB_PATH"
+          if [ "${SKIP_CRYPT_SHARED_LIB}" = "true" ]; then
+            CRYPT_SHARED_LIB_PATH=""
+            echo "crypt_shared library is skipped"
+          elif [ -z "${CRYPT_SHARED_LIB_PATH}" ]; then
+            echo "crypt_shared library path is empty"
+          else
+            CRYPT_SHARED_LIB_PATH=${CRYPT_SHARED_LIB_PATH}
+            echo "crypt_shared library will be loaded from path: $CRYPT_SHARED_LIB_PATH"
           fi
 
           export GOFLAGS=-mod=vendor
@@ -564,6 +542,7 @@ functions:
           GCP_EMAIL="${cse_gcp_email}" \
           GCP_PRIVATE_KEY="${cse_gcp_private_key}" \
           REQUIRE_API_VERSION="${REQUIRE_API_VERSION}" \
+          CRYPT_SHARED_LIB_PATH="$CRYPT_SHARED_LIB_PATH" \
           make evg-test-versioned-api \
           PKG_CONFIG_PATH=$PKG_CONFIG_PATH \
           LD_LIBRARY_PATH=$LD_LIBRARY_PATH
@@ -618,18 +597,18 @@ functions:
       type: test
       params:
         working_dir: src/go.mongodb.org/mongo-driver
+        add_expansions_to_env: true
         script: |
           ${PREPARE_SHELL}
 
-          export GOFLAGS=-mod=vendor
           AUTH="auth" \
           SSL="ssl" \
           MONGODB_URI="${SERVERLESS_URI}" \
           SERVERLESS="serverless" \
           SERVERLESS_ATLAS_USER="${SERVERLESS_ATLAS_USER}" \
           SERVERLESS_ATLAS_PASSWORD="${SERVERLESS_ATLAS_PASSWORD}" \
-          MONGO_GO_DRIVER_COMPRESSOR=${MONGO_GO_DRIVER_COMPRESSOR} \
-          make evg-test-serverless
+          MAKEFILE_TARGET=evg-test-serverless \
+            sh ${PROJECT_DIRECTORY}/.evergreen/run-tests.sh
 
   run-atlas-data-lake-test:
     - command: shell.exec
@@ -647,17 +626,13 @@ functions:
   run-valid-ocsp-server:
     - command: shell.exec
       params:
-        script: |
-          cd ${DRIVERS_TOOLS}/.evergreen/ocsp
-          ${PYTHON3_BINARY} -m venv ./venv
-          ./venv/${VENV_BIN_DIR|bin}/pip3 install -r mock-ocsp-responder-requirements.txt
-    - command: shell.exec
-      params:
         background: true
+        shell: "bash"
         script: |
           cd ${DRIVERS_TOOLS}/.evergreen/ocsp
+          . ./activate-ocspvenv.sh
 
-          ./venv/${VENV_BIN_DIR|bin}/python ocsp_mock.py \
+          python ocsp_mock.py \
           --ca_file ${OCSP_ALGORITHM}/ca.pem \
           --ocsp_responder_cert ${OCSP_ALGORITHM}/ca.crt \
           --ocsp_responder_key ${OCSP_ALGORITHM}/ca.key \
@@ -666,17 +641,13 @@ functions:
   run-revoked-ocsp-server:
     - command: shell.exec
       params:
-        script: |
-          cd ${DRIVERS_TOOLS}/.evergreen/ocsp
-          ${PYTHON3_BINARY} -m venv ./venv
-          ./venv/${VENV_BIN_DIR|bin}/pip3 install -r mock-ocsp-responder-requirements.txt
-    - command: shell.exec
-      params:
         background: true
+        shell: "bash"
         script: |
           cd ${DRIVERS_TOOLS}/.evergreen/ocsp
+          . ./activate-ocspvenv.sh
 
-          ./venv/${VENV_BIN_DIR|bin}/python ocsp_mock.py \
+          python ocsp_mock.py \
           --ca_file ${OCSP_ALGORITHM}/ca.pem \
           --ocsp_responder_cert ${OCSP_ALGORITHM}/ca.crt \
           --ocsp_responder_key ${OCSP_ALGORITHM}/ca.key \
@@ -687,17 +658,13 @@ functions:
   run-valid-delegate-ocsp-server:
     - command: shell.exec
       params:
-        script: |
-          cd ${DRIVERS_TOOLS}/.evergreen/ocsp
-          ${PYTHON3_BINARY} -m venv ./venv
-          ./venv/${VENV_BIN_DIR|bin}/pip3 install -r mock-ocsp-responder-requirements.txt
-    - command: shell.exec
-      params:
         background: true
+        shell: "bash"
         script: |
           cd ${DRIVERS_TOOLS}/.evergreen/ocsp
+          . ./activate-ocspvenv.sh
 
-          ./venv/${VENV_BIN_DIR|bin}/python ocsp_mock.py \
+          python ocsp_mock.py \
           --ca_file ${OCSP_ALGORITHM}/ca.pem \
           --ocsp_responder_cert ${OCSP_ALGORITHM}/ocsp-responder.crt \
           --ocsp_responder_key ${OCSP_ALGORITHM}/ocsp-responder.key \
@@ -706,17 +673,13 @@ functions:
   run-revoked-delegate-ocsp-server:
     - command: shell.exec
       params:
-        script: |
-          cd ${DRIVERS_TOOLS}/.evergreen/ocsp
-          ${PYTHON3_BINARY} -m venv ./venv
-          ./venv/${VENV_BIN_DIR|bin}/pip3 install -r mock-ocsp-responder-requirements.txt
-    - command: shell.exec
-      params:
         background: true
+        shell: "bash"
         script: |
           cd ${DRIVERS_TOOLS}/.evergreen/ocsp
+          . ./activate-ocspvenv.sh
 
-          ./venv/${VENV_BIN_DIR|bin}/python ocsp_mock.py \
+          python ocsp_mock.py \
           --ca_file ${OCSP_ALGORITHM}/ca.pem \
           --ocsp_responder_cert ${OCSP_ALGORITHM}/ocsp-responder.crt \
           --ocsp_responder_key ${OCSP_ALGORITHM}/ocsp-responder.key \
@@ -772,10 +735,11 @@ functions:
       type: test
       params:
         working_dir: "src"
+        shell: "bash"
         script: |
           ${PREPARE_SHELL}
           cd ${DRIVERS_TOOLS}/.evergreen/auth_aws
-          . ./activate_venv.sh
+          . ./activate-authawsvenv.sh
           mongo aws_e2e_regular_aws.js
     - command: shell.exec
       type: test
@@ -802,10 +766,11 @@ functions:
       type: test
       params:
         working_dir: "src"
+        shell: "bash"
         script: |
           ${PREPARE_SHELL}
           cd ${DRIVERS_TOOLS}/.evergreen/auth_aws
-          . ./activate_venv.sh
+          . ./activate-authawsvenv.sh
           mongo aws_e2e_assume_role.js
     - command: shell.exec
       type: test
@@ -838,6 +803,7 @@ functions:
       type: test
       params:
         working_dir: "src"
+        shell: "bash"
         script: |
           ${PREPARE_SHELL}
           if [ "${SKIP_EC2_AUTH_TEST}" = "true" ]; then
@@ -845,7 +811,7 @@ functions:
             exit 0
           fi
           cd ${DRIVERS_TOOLS}/.evergreen/auth_aws
-          . ./activate_venv.sh
+          . ./activate-authawsvenv.sh
           mongo aws_e2e_ec2.js
     - command: shell.exec
       type: test
@@ -856,6 +822,10 @@ functions:
           if [ "${SKIP_EC2_AUTH_TEST}" = "true" ]; then
             exit 0
           fi
+
+          # Truncate "prepare_mongodb_aws.sh" to zero length. If file not present, creates zero-length file.
+          : > "${PROJECT_DIRECTORY}/prepare_mongodb_aws.sh"
+
           ${PROJECT_DIRECTORY}/.evergreen/run-mongodb-aws-test.sh
 
   run-aws-auth-test-with-aws-credentials-as-environment-variables:
@@ -916,6 +886,7 @@ functions:
       type: test
       params:
         working_dir: "src"
+        shell: "bash"
         script: |
           ${PREPARE_SHELL}
           if [ "${SKIP_ECS_AUTH_TEST}" = "true" ]; then
@@ -929,7 +900,7 @@ functions:
           cp ${PROJECT_DIRECTORY}/.evergreen/run-mongodb-aws-ecs-test.sh $ECS_SRC_DIR/.evergreen
           tar -czf $ECS_SRC_DIR/src.tgz -C $PROJECT_DIRECTORY .
           cd $AUTH_AWS_DIR
-          . ./activate_venv.sh
+          . ./activate-authawsvenv.sh
           cat <<EOF > setup.js
             const mongo_binaries = "$MONGODB_BINARIES";
             const project_dir = "$ECS_SRC_DIR";
@@ -940,11 +911,12 @@ functions:
   start-kms-mock-server:
     - command: shell.exec
       params:
+        shell: "bash"
         script: |
           ${PREPARE_SHELL}
 
           cd ${DRIVERS_TOOLS}/.evergreen/csfle
-          . ./activate_venv.sh
+          . ./activate-kmstlsvenv.sh
     - command: shell.exec
       params:
         background: true
@@ -955,11 +927,12 @@ functions:
   start-kms-mock-server-require-client-cert:
     - command: shell.exec
       params:
+        shell: "bash"
         script: |
           ${PREPARE_SHELL}
 
           cd ${DRIVERS_TOOLS}/.evergreen/csfle
-          . ./activate_venv.sh
+          . ./activate-kmstlsvenv.sh
     - command: shell.exec
       params:
         background: true
@@ -970,29 +943,28 @@ functions:
   start-cse-servers:
     - command: shell.exec
       params:
+        shell: "bash"
         script: |
           ${PREPARE_SHELL}
 
           cd ${DRIVERS_TOOLS}/.evergreen/csfle
+          . ./activate-kmstlsvenv.sh
 
-          # only run this if virtualenv is installed
-          if ${PYTHON3_BINARY} -m venv ./venv; then
-            . ./activate_venv.sh
-
-            # TODO (GODRIVER-2239): Stabilize this pip install with a non-forked version of PyKMIP in
-            pip install git+https://github.com/kevinAlbs/PyKMIP.git@expand_tls12_ciphers
-          else
-            echo "Python module venv not found, skipping virtual environment setup..."
-          fi
     - command: shell.exec
       params:
         background: true
         script: |
           cd ${DRIVERS_TOOLS}/.evergreen/csfle
           if [ "Windows_NT" = "$OS" ]; then
-            kmstlsvenv/Scripts/python.exe -u kms_kmip_server.py --port 5698
+            kmstlsvenv/Scripts/python.exe -u kms_kmip_server.py \
+              --port 5698 \
+              --ca_file "${PROJECT_DIRECTORY}/testdata/kmip-certs/ca-ec.pem" \
+              --cert_file "${PROJECT_DIRECTORY}/testdata/kmip-certs/server-ec.pem"
           else
-            ./kmstlsvenv/bin/python3 -u kms_kmip_server.py --port 5698
+            ./kmstlsvenv/bin/python3 -u kms_kmip_server.py \
+              --port 5698 \
+              --ca_file "${PROJECT_DIRECTORY}/testdata/kmip-certs/ca-ec.pem" \
+              --cert_file "${PROJECT_DIRECTORY}/testdata/kmip-certs/server-ec.pem"
           fi
 
   run-kms-tls-test:
@@ -1045,12 +1017,20 @@ functions:
           AZURE_CLIENT_SECRET="${cse_azure_client_secret}" \
           GCP_EMAIL="${cse_gcp_email}" \
           GCP_PRIVATE_KEY="${cse_gcp_private_key}" \
-          CSFLE_TLS_CA_FILE="$DRIVERS_TOOLS/.evergreen/x509gen/ca.pem"
-          CSFLE_TLS_CERTIFICATE_KEY_FILE="$DRIVERS_TOOLS/.evergreen/x509gen/client.pem"
+          CSFLE_TLS_CA_FILE="$PROJECT_DIRECTORY/testdata/kmip-certs/ca-ec.pem"
+          CSFLE_TLS_CERTIFICATE_KEY_FILE="$PROJECT_DIRECTORY/testdata/kmip-certs/client-ec.pem"
           make evg-test-kmip \
           PKG_CONFIG_PATH=$PKG_CONFIG_PATH \
           LD_LIBRARY_PATH=$LD_LIBRARY_PATH
 
+  run-fuzz-tests:
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: "src"
+        script: |
+          ${PREPARE_SHELL}
+          ${PROJECT_DIRECTORY}/.evergreen/run-fuzz.sh
 pre:
   - func: fetch-source
   - func: prepare-resources
@@ -1072,6 +1052,7 @@ tasks:
   - name: sa-fmt
     tags: ["static-analysis"]
     commands:
+      - func: install-linters
       - func: run-make
         vars:
           targets: check-fmt
@@ -1597,6 +1578,21 @@ tasks:
       - func: run-load-balancer
       - func: run-load-balancer-tests
 
+  - name: test-race
+    tags: ["race"]
+    commands:
+      - func: bootstrap-mongo-orchestration
+        vars:
+          TOPOLOGY: "replica_set"
+          AUTH: "noauth"
+          SSL: "nossl"
+      - func: run-tests
+        vars:
+          TOPOLOGY: "replica_set"
+          AUTH: "noauth"
+          SSL: "nossl"
+          RACE: "-race"
+
   - name: test-replicaset-noauth-nossl
     tags: ["test", "replicaset"]
     commands:
@@ -1638,9 +1634,9 @@ tasks:
           TOPOLOGY: "replica_set"
           AUTH: "auth"
           SSL: "ssl"
-          # Don't download the crypt_shared library, which should cause all of the tests to fall
+          # Don't use the crypt_shared library, which should cause all of the tests to fall
           # back to using mongocryptd instead of crypt_shared.
-          SKIP_CRYPT_SHARED_LIB_DOWNLOAD: "true"
+          SKIP_CRYPT_SHARED_LIB: "true"
 
   - name: test-replicaset-auth-nossl
     tags: ["test", "replicaset", "authssl"]
@@ -1807,13 +1803,15 @@ tasks:
         vars:
           MONGO_GO_DRIVER_COMPRESSOR: "snappy"
 
-  - name: go1.10-build
+  - name: go1.13-build
     tags: ["compile-check"]
     commands:
       - func: run-make
         vars:
           targets: "build"
-          BUILD_ENV: "PATH=/opt/golang/go1.10/bin:$PATH GOROOT=/opt/golang/go1.10"
+          # Use GO111MODULE=off to disable modules, as go versions less than
+          # 1.16 will complain about the retract directives in go.mod.
+          BUILD_ENV: "GO111MODULE=off PATH=/opt/golang/go1.13/bin:$PATH GOROOT=/opt/golang/go1.13"
 
   # Build with whatever the latest Go version is that we're using for tests
   - name: build
@@ -1968,6 +1966,117 @@ tasks:
         vars:
           MONGO_GO_DRIVER_COMPRESSOR: "snappy"
 
+  - name: "testgcpkms-task"
+    commands:
+    - command: shell.exec
+      type: setup
+      params:
+        working_dir: src/go.mongodb.org/mongo-driver
+        shell: "bash"
+        script: |
+          ${PREPARE_SHELL}
+          echo "Building build-gcpkms-test ... begin"
+          BUILD_TAGS="-tags cse" \
+          PKG_CONFIG_PATH=$PKG_CONFIG_PATH \
+            make build-gcpkms-test
+          echo "Building build-gcpkms-test ... end"
+
+          echo "Copying files ... begin"
+          export GCPKMS_GCLOUD=${GCPKMS_GCLOUD}
+          export GCPKMS_PROJECT=${GCPKMS_PROJECT}
+          export GCPKMS_ZONE=${GCPKMS_ZONE}
+          export GCPKMS_INSTANCENAME=${GCPKMS_INSTANCENAME}
+          tar czf testgcpkms.tgz ./testgcpkms ./install/libmongocrypt/lib/libmongocrypt.*
+          GCPKMS_SRC=testgcpkms.tgz GCPKMS_DST=$GCPKMS_INSTANCENAME: $DRIVERS_TOOLS/.evergreen/csfle/gcpkms/copy-file.sh
+          echo "Copying files ... end"
+
+          echo "Untarring file ... begin"
+          GCPKMS_CMD="tar xf testgcpkms.tgz" $DRIVERS_TOOLS/.evergreen/csfle/gcpkms/run-command.sh
+          echo "Untarring file ... end"
+
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src/go.mongodb.org/mongo-driver
+        shell: "bash"
+        script: |
+          ${PREPARE_SHELL}
+          export GCPKMS_GCLOUD=${GCPKMS_GCLOUD}
+          export GCPKMS_PROJECT=${GCPKMS_PROJECT}
+          export GCPKMS_ZONE=${GCPKMS_ZONE}
+          export GCPKMS_INSTANCENAME=${GCPKMS_INSTANCENAME}
+          GCPKMS_CMD="LD_LIBRARY_PATH=./install/libmongocrypt/lib MONGODB_URI='mongodb://localhost:27017' ./testgcpkms" $DRIVERS_TOOLS/.evergreen/csfle/gcpkms/run-command.sh
+
+  - name: "testgcpkms-fail-task"
+    # testgcpkms-fail-task runs in a non-GCE environment.
+    # It is expected to fail to obtain GCE credentials.
+    commands:
+      - command: shell.exec
+        type: test
+        params:
+          working_dir: src/go.mongodb.org/mongo-driver
+          shell: "bash"
+          script: |
+            ${PREPARE_SHELL}
+            echo "Building build-gcpkms-test ... begin"
+            BUILD_TAGS="-tags cse" \
+            PKG_CONFIG_PATH=$PKG_CONFIG_PATH \
+              make build-gcpkms-test
+            echo "Building build-gcpkms-test ... end"
+            LD_LIBRARY_PATH=./install/libmongocrypt/lib \
+            MONGODB_URI='mongodb://localhost:27017/' \
+            EXPECT_ERROR='unable to retrieve GCP credentials' \
+              ./testgcpkms
+
+  - name: "testawskms-task"
+    commands:
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src/go.mongodb.org/mongo-driver
+        shell: "bash"
+        script: |
+          ${PREPARE_SHELL}
+          echo "Building build-awskms-test ... begin"
+          BUILD_TAGS="-tags cse" \
+          PKG_CONFIG_PATH=$PKG_CONFIG_PATH \
+            make build-awskms-test
+          echo "Building build-awskms-test ... end"
+
+          export AWS_ACCESS_KEY_ID="${cse_aws_access_key_id}"
+          export AWS_SECRET_ACCESS_KEY="${cse_aws_secret_access_key}"
+
+          LD_LIBRARY_PATH=./install/libmongocrypt/lib \
+          MONGODB_URI='${atlas_free_tier_uri}' \
+            ./testawskms
+
+  - name: "testawskms-fail-task"
+    # testawskms-fail-task runs without environment variables.
+    # It is expected to fail to obtain credentials.
+    commands:
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src/go.mongodb.org/mongo-driver
+        shell: "bash"
+        script: |
+          ${PREPARE_SHELL}
+          echo "Building build-awskms-test ... begin"
+          BUILD_TAGS="-tags cse" \
+          PKG_CONFIG_PATH=$PKG_CONFIG_PATH \
+            make build-awskms-test
+          echo "Building build-awskms-test ... end"
+
+          LD_LIBRARY_PATH=./install/libmongocrypt/lib \
+          MONGODB_URI='${atlas_free_tier_uri}' \
+          EXPECT_ERROR='unable to retrieve AWS credentials' \
+            ./testawskms
+
+  - name: "test-fuzz"
+    commands:
+      - func: bootstrap-mongo-orchestration
+      - func: run-fuzz-tests
+
 axes:
   - id: version
     display_name: MongoDB Version
@@ -1996,22 +2105,6 @@ axes:
         display_name: "3.6"
         variables:
           VERSION: "3.6"
-      - id: "3.4"
-        display_name: "3.4"
-        variables:
-          VERSION: "3.4"
-      - id: "3.2"
-        display_name: "3.2"
-        variables:
-          VERSION: "3.2"
-      - id: "3.0"
-        display_name: "3.0"
-        variables:
-          VERSION: "3.0"
-      - id: "2.6"
-        display_name: "2.6"
-        variables:
-          VERSION: "2.6"
       - id: "rapid"
         display_name: "rapid"
         variables:
@@ -2021,119 +2114,88 @@ axes:
         variables:
           VERSION: "latest"
 
-  # OSes that support versions of MongoDB >= 2.6 with SSL.
-  - id: os-ssl-legacy
-    display_name: OS
-    values:
-      - id: "ubuntu1404-go-1-16"
-        display_name: "Ubuntu 14.04"
-        run_on: ubuntu1404-test
-        variables:
-          # The latest Go version available on the Ubuntu 14.04 Evergreen CI image is Go 1.16.
-          GO_DIST: "/opt/golang/go1.16"
-          # The GCC toolchain that comes with Ubuntu 14.04 is incompatible with the standard binary
-          # release of Go 1.16. As a result, Cgo builds on Ubuntu 14.04 fail with a linking error
-          # (see https://github.com/golang/go/issues/43996). On Ubuntu 14.04, we only run tests for
-          # server v2.6 and 3.X, which don't support client-side encryption. Exclude all build tags
-          # to prevent attempting to link the client-side encryption (libmongocrypt) binaries when
-          # running Go tests.
-          GO_BUILD_TAGS: ""
-          # There is no crypt_shared library download for Ubuntu 14.04. Skip downloading it and let the
-          # tests use mongocryptd instead.
-          SKIP_CRYPT_SHARED_LIB_DOWNLOAD: "true"
-
   # OSes that require >= 3.2 for SSL
   - id: os-ssl-32
     display_name: OS
     values:
-      - id: "windows-64-go-1-17"
+      - id: "windows-64-go-1-18"
         display_name: "Windows 64-bit"
         run_on:
           - windows-64-vs2017-test
         variables:
           GCC_PATH: "/cygdrive/c/ProgramData/chocolatey/lib/mingw/tools/install/mingw64/bin"
-          GO_DIST: "C:\\golang\\go1.17"
-          PYTHON3_BINARY: "C:/python/Python38/python.exe"
+          GO_DIST: "C:\\golang\\go1.18"
           VENV_BIN_DIR: "Scripts"
-      - id: "ubuntu1604-64-go-1-17"
+      - id: "ubuntu1604-64-go-1-18"
         display_name: "Ubuntu 16.04"
         run_on: ubuntu1604-build
         variables:
-          GO_DIST: "/opt/golang/go1.17"
-          PYTHON3_BINARY: "/opt/python/3.8/bin/python3"
-          # There is no crypt_shared library download for Ubuntu 16.04. Skip downloading it and let the
-          # tests use mongocryptd instead.
-          SKIP_CRYPT_SHARED_LIB_DOWNLOAD: "true"
-      - id: "osx-go-1-17"
-        display_name: "MacOS 10.15"
-        run_on: macos-1015
+          GO_DIST: "/opt/golang/go1.18"
+      - id: "osx-go-1-18"
+        display_name: "MacOS 11.0"
+        run_on: macos-1100
+        batchtime: 1440 # Run at most once per 24 hours.
         variables:
-          GO_DIST: "/opt/golang/go1.17"
-          PYTHON3_BINARY: python3
+          GO_DIST: "/opt/golang/go1.18"
 
   # OSes that require >= 4.0 for SSL
   - id: os-ssl-40
     display_name: OS
     values:
-      - id: "windows-64-go-1-17"
+      - id: "windows-64-go-1-18"
         display_name: "Windows 64-bit"
         run_on:
           - windows-64-vs2017-test
         variables:
           GCC_PATH: "/cygdrive/c/ProgramData/chocolatey/lib/mingw/tools/install/mingw64/bin"
-          GO_DIST: "C:\\golang\\go1.17"
-          PYTHON3_BINARY: "C:/python/Python38/python.exe"
+          GO_DIST: "C:\\golang\\go1.18"
           VENV_BIN_DIR: "Scripts"
-      - id: "ubuntu1804-64-go-1-17"
+      - id: "ubuntu1804-64-go-1-18"
         display_name: "Ubuntu 18.04"
         run_on: ubuntu1804-build
         variables:
-          GO_DIST: "/opt/golang/go1.17"
-          PYTHON3_BINARY: "/opt/python/3.8/bin/python3"
-      - id: "osx-go-1-17"
-        display_name: "MacOS 10.15"
-        run_on: macos-1015
+          GO_DIST: "/opt/golang/go1.18"
+      - id: "osx-go-1-18"
+        display_name: "MacOS 11.0"
+        run_on: macos-1100
+        batchtime: 1440 # Run at most once per 24 hours.
         variables:
-          GO_DIST: "/opt/golang/go1.17"
-          PYTHON3_BINARY: python3
+          GO_DIST: "/opt/golang/go1.18"
 
   # OCSP linux tasks need to run against this OS since stapling is disabled on Ubuntu 18.04 (SERVER-51364)
   - id: ocsp-rhel-70
     display_name: OS
     values:
-      - id: "rhel70-go-1-17"
+      - id: "rhel70-go-1-18"
         display_name: "RHEL 7.0"
         run_on: rhel70-build
         variables:
-          GO_DIST: "/opt/golang/go1.17"
-          PYTHON3_BINARY: "/opt/python/3.6/bin/python3"
+          GO_DIST: "/opt/golang/go1.18"
 
   - id: os-aws-auth
     display_name: OS
     values:
-      - id: "windows-64-vsMulti-small-go-1-17"
+      - id: "windows-64-vsMulti-small-go-1-18"
         display_name: "Windows 64-bit"
         run_on:
           - windows-64-vsMulti-small
         variables:
           GCC_PATH: "/cygdrive/c/ProgramData/chocolatey/lib/mingw/tools/install/mingw64/bin"
-          GO_DIST: "C:\\golang\\go1.17"
+          GO_DIST: "C:\\golang\\go1.18"
           SKIP_ECS_AUTH_TEST: true
-          PYTHON3: "C:/python/Python38/python.exe"
-      - id: "ubuntu1804-64-go-1-17"
+      - id: "ubuntu1804-64-go-1-18"
         display_name: "Ubuntu 18.04"
         run_on: ubuntu1804-test
         variables:
-          GO_DIST: "/opt/golang/go1.17"
-          PYTHON3: python3
-      - id: "osx-go-1-17"
-        display_name: "MacOS 10.15"
-        run_on: macos-1015
+          GO_DIST: "/opt/golang/go1.18"
+      - id: "osx-go-1-18"
+        display_name: "MacOS 11.0"
+        run_on: macos-1100
+        batchtime: 1440 # Run at most once per 24 hours.
         variables:
-          GO_DIST: "/opt/golang/go1.17"
+          GO_DIST: "/opt/golang/go1.18"
           SKIP_ECS_AUTH_TEST: true
           SKIP_EC2_AUTH_TEST: true
-          PYTHON3: python3
 
 task_groups:
   - name: serverless_task_group
@@ -2144,6 +2206,7 @@ task_groups:
       - func: prepare-resources
       - func: fix-absolute-paths
       - func: make-files-executable
+      - func: start-cse-servers
       - command: shell.exec
         params:
           shell: "bash"
@@ -2158,6 +2221,56 @@ task_groups:
       - command: expansions.update
         params:
           file: serverless-expansion.yml
+      - command: shell.exec
+        params:
+          shell: "bash"
+          script: |
+            ${PREPARE_SHELL}
+
+            if [ -z "${SERVERLESS_MONGODB_VERSION}" ]; then
+              echo "expected SERVERLESS_MONGODB_VERSION to be set"
+              exit 1
+            fi
+
+            # Download the enterprise server download for current platform to $MONGODB_BINARIES.
+            # This is required for tests that need mongocryptd.
+            # $MONGODB_BINARIES is added to the $PATH in fetch-source.
+            ${PYTHON3_BINARY} $DRIVERS_TOOLS/.evergreen/mongodl.py \
+                --component archive \
+                --version ${SERVERLESS_MONGODB_VERSION} \
+                --edition enterprise \
+                --out $MONGODB_BINARIES \
+                --strip-path-components 2
+
+            # Download the crypt_shared dynamic library for the current platform.
+            ${PYTHON3_BINARY} $DRIVERS_TOOLS/.evergreen/mongodl.py \
+              --component crypt_shared \
+              --version ${SERVERLESS_MONGODB_VERSION} \
+              --edition enterprise \
+              --out . \
+              --only "**/mongo_crypt_v1.*" \
+              --strip-path-components 1
+
+            # Find the crypt_shared library file in the current directory and set the CRYPT_SHARED_LIB_PATH to
+            # the path of that file. Only look for .so, .dll, or .dylib files to prevent matching any other
+            # downloaded files.
+            CRYPT_SHARED_LIB_PATH="$(find $(pwd) -maxdepth 1 -type f \
+              -name 'mongo_crypt_v1.so' -o \
+              -name 'mongo_crypt_v1.dll' -o \
+              -name 'mongo_crypt_v1.dylib')"
+
+            # If we're on Windows, convert the "cygdrive" path to Windows-style paths.
+            if [ "Windows_NT" = "$OS" ]; then
+                CRYPT_SHARED_LIB_PATH=$(cygpath -m $CRYPT_SHARED_LIB_PATH)
+            fi
+
+            echo "CRYPT_SHARED_LIB_PATH: $CRYPT_SHARED_LIB_PATH" >> crypt-expansion.yml
+
+      # Load the expansion file to make an evergreen variable with the current unique version
+      - command: expansions.update
+        params:
+          file: crypt-expansion.yml
+
     teardown_group:
       - command: shell.exec
         params:
@@ -2185,6 +2298,42 @@ task_groups:
           display_name: "mongodb-logs.tar.gz"
     tasks:
       - ".serverless"
+  - name: testgcpkms_task_group
+    setup_group_can_fail_task: true
+    setup_group_timeout_secs: 1800 # 30 minutes
+    setup_group:
+      - func: fetch-source
+      - func: prepare-resources
+      - func: fix-absolute-paths
+      - func: make-files-executable
+      - command: shell.exec
+        params:
+          shell: "bash"
+          script: |
+            ${PREPARE_SHELL}
+            echo '${testgcpkms_key_file}' > /tmp/testgcpkms_key_file.json
+            export GCPKMS_KEYFILE=/tmp/testgcpkms_key_file.json
+            export GCPKMS_DRIVERS_TOOLS=$DRIVERS_TOOLS
+            export GCPKMS_SERVICEACCOUNT="${testgcpkms_service_account}"
+            $DRIVERS_TOOLS/.evergreen/csfle/gcpkms/create-and-setup-instance.sh
+      # Load the GCPKMS_GCLOUD, GCPKMS_INSTANCE, GCPKMS_REGION, and GCPKMS_ZONE expansions.
+      - command: expansions.update
+        params:
+          file: testgcpkms-expansions.yml
+    teardown_group:
+      - command: shell.exec
+        params:
+          shell: "bash"
+          script: |
+            ${PREPARE_SHELL}
+            export GCPKMS_GCLOUD=${GCPKMS_GCLOUD}
+            export GCPKMS_PROJECT=${GCPKMS_PROJECT}
+            export GCPKMS_ZONE=${GCPKMS_ZONE}
+            export GCPKMS_INSTANCENAME=${GCPKMS_INSTANCENAME}
+            $DRIVERS_TOOLS/.evergreen/csfle/gcpkms/delete-instance.sh
+    tasks:
+      - testgcpkms-task
+
 
 buildvariants:
   - name: static-analysis
@@ -2192,7 +2341,7 @@ buildvariants:
     run_on:
       - ubuntu1804-build
     expansions:
-      GO_DIST: "/opt/golang/go1.17"
+      GO_DIST: "/opt/golang/go1.18"
     tasks:
       - name: ".static-analysis"
 
@@ -2201,7 +2350,7 @@ buildvariants:
     run_on:
       - ubuntu1804-build
     expansions:
-      GO_DIST: "/opt/golang/go1.17"
+      GO_DIST: "/opt/golang/go1.18"
     tasks:
       - name: ".performance"
 
@@ -2210,7 +2359,7 @@ buildvariants:
     run_on:
       - ubuntu1804-test
     expansions:
-      GO_DIST: "/opt/golang/go1.17"
+      GO_DIST: "/opt/golang/go1.18"
     tasks:
       - name: ".compile-check"
 
@@ -2219,7 +2368,7 @@ buildvariants:
     run_on:
       - ubuntu1804-build
     expansions:
-      GO_DIST: "/opt/golang/go1.17"
+      GO_DIST: "/opt/golang/go1.18"
     tasks:
       - name: "atlas-test"
 
@@ -2228,33 +2377,9 @@ buildvariants:
     run_on:
       - ubuntu1804-build
     expansions:
-      GO_DIST: "/opt/golang/go1.17"
+      GO_DIST: "/opt/golang/go1.18"
     tasks:
       - name: "test-atlas-data-lake"
-
-  - matrix_name: "tests-legacy-auth-ssl"
-    matrix_spec: { version: ["2.6", "3.0"], os-ssl-legacy: "*" }
-    display_name: "${version} ${os-ssl-legacy}"
-    tasks:
-      - name: ".test !.enterprise-auth !.compression !.mongocryptd"
-
-  - matrix_name: "tests-legacy-noauth-nossl"
-    matrix_spec: { version: ["2.6", "3.0"], os-ssl-32: "*" }
-    display_name: "${version} ${os-ssl-32}"
-    tasks:
-      - name: ".test !.authssl !.enterprise-auth !.compression !.mongocryptd"
-
-  - matrix_name: "tests-nonlegacy-servers"
-    matrix_spec: { version: "3.2", os-ssl-32: "*" }
-    display_name: "${version} ${os-ssl-32}"
-    tasks:
-      - name: ".test !.enterprise-auth !.compression"
-
-  - matrix_name: "tests-nonlegacy-servers-with-snappy-support"
-    matrix_spec: { version: "3.4", os-ssl-32: "*" }
-    display_name: "${version} ${os-ssl-32}"
-    tasks:
-      - name: ".test !.enterprise-auth !.zlib !.zstd"
 
   - matrix_name: "tests-36-with-zlib-support"
     matrix_spec: { version: ["3.6"], os-ssl-32: "*" }
@@ -2287,14 +2412,14 @@ buildvariants:
       - name: "aws-auth-test"
 
   - matrix_name: "ocsp-test"
-    matrix_spec: { version: ["4.4", "5.0", "6.0", "latest"], ocsp-rhel-70: ["rhel70-go-1-17"] }
+    matrix_spec: { version: ["4.4", "5.0", "6.0", "latest"], ocsp-rhel-70: ["rhel70-go-1-18"] }
     display_name: "OCSP ${version} ${ocsp-rhel-70}"
     batchtime: 20160 # Use a batchtime of 14 days as suggested by the OCSP test README
     tasks:
       - name: ".ocsp"
 
   - matrix_name: "ocsp-test-windows"
-    matrix_spec: { version: ["4.4", "5.0", "6.0", "latest"], os-ssl-40: ["windows-64-go-1-17"] }
+    matrix_spec: { version: ["4.4", "5.0", "6.0", "latest"], os-ssl-40: ["windows-64-go-1-18"] }
     display_name: "OCSP ${version} ${os-ssl-40}"
     batchtime: 20160 # Use a batchtime of 14 days as suggested by the OCSP test README
     tasks:
@@ -2302,12 +2427,18 @@ buildvariants:
       - name: ".ocsp-rsa !.ocsp-staple"
 
   - matrix_name: "ocsp-test-macos"
-    matrix_spec: { version: ["4.4", "5.0", "6.0", "latest"], os-ssl-40: ["osx-go-1-17"] }
+    matrix_spec: { version: ["4.4", "5.0", "6.0", "latest"], os-ssl-40: ["osx-go-1-18"] }
     display_name: "OCSP ${version} ${os-ssl-40}"
     batchtime: 20160 # Use a batchtime of 14 days as suggested by the OCSP test README
     tasks:
       # macos MongoDB servers do not staple OCSP responses and only support RSA.
       - name: ".ocsp-rsa !.ocsp-staple"
+
+  - matrix_name: "race-test"
+    matrix_spec: { version: ["latest"], os-ssl-40: ["ubuntu1804-64-go-1-18"] }
+    display_name: "Race Detector Test"
+    tasks:
+      - name: ".race"
 
   - matrix_name: "versioned-api-test"
     matrix_spec: { version: ["5.0", "6.0", "latest"], os-ssl-40: "*" }
@@ -2316,26 +2447,54 @@ buildvariants:
       - name: ".versioned-api"
 
   - matrix_name: "kms-tls-test"
-    matrix_spec: { version: ["latest"], os-ssl-40: ["ubuntu1804-64-go-1-17"] }
+    matrix_spec: { version: ["latest"], os-ssl-40: ["ubuntu1804-64-go-1-18"] }
     display_name: "KMS TLS ${os-ssl-40}"
     tasks:
       - name: ".kms-tls"
 
   - matrix_name: "load-balancer-test"
     # The LB software is only available on Ubuntu 18.04, so we don't test on all OSes.
-    matrix_spec: { version: ["5.0", "6.0", "latest", "rapid"], os-ssl-40: ["ubuntu1804-64-go-1-17"] }
+    matrix_spec: { version: ["5.0", "6.0", "latest", "rapid"], os-ssl-40: ["ubuntu1804-64-go-1-18"] }
     display_name: "Load Balancer Support ${version} ${os-ssl-40}"
     tasks:
       - name: ".load-balancer"
 
   - matrix_name: "serverless"
-    matrix_spec: { os-ssl-40: ["ubuntu1804-64-go-1-17"] }
+    matrix_spec: { os-ssl-40: ["ubuntu1804-64-go-1-18"] }
     display_name: "Serverless ${os-ssl-40}"
     tasks:
       - "serverless_task_group"
 
   - matrix_name: "kms-kmip-test"
-    matrix_spec: { version: ["latest"], os-ssl-40: ["ubuntu1804-64-go-1-17"] }
+    matrix_spec: { version: ["latest"], os-ssl-40: ["ubuntu1804-64-go-1-18"] }
     display_name: "KMS KMIP ${os-ssl-40}"
     tasks:
       - name: ".kms-kmip"
+
+  - matrix_name: "fuzz-test"
+    matrix_spec: { version: ["5.0"], os-ssl-40: ["ubuntu1804-64-go-1-18"] }
+    display_name: "Fuzz ${version} ${os-ssl-40}"
+    tasks:
+      - name: "test-fuzz"
+        batchtime: 1440 # Run at most once per 24 hours.
+
+  - name: testgcpkms-variant
+    display_name: "GCP KMS"
+    run_on:
+      - debian11-small
+    expansions:
+      GO_DIST: "/opt/golang/go1.18"
+    tasks:
+      - name: testgcpkms_task_group
+        batchtime: 20160 # Use a batchtime of 14 days as suggested by the CSFLE test README
+      - testgcpkms-fail-task
+
+  - name: testawskms-variant
+    display_name: "AWS KMS"
+    run_on:
+      - debian11-small
+    expansions:
+      GO_DIST: "/opt/golang/go1.18"
+    tasks:
+      - testawskms-task
+      - testawskms-fail-task

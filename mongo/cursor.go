@@ -15,7 +15,6 @@ import (
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/bsoncodec"
-	"go.mongodb.org/mongo-driver/x/bsonx"
 	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
 	"go.mongodb.org/mongo-driver/x/mongo/driver"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/session"
@@ -83,8 +82,6 @@ func NewCursorFromDocuments(documents []interface{}, err error, registry *bsonco
 		switch t := doc.(type) {
 		case nil:
 			return nil, ErrNilDocument
-		case bsonx.Doc:
-			doc = t.Copy()
 		case []byte:
 			// Slight optimization so we'll just use MarshalBSON and not go through the codec machinery.
 			doc = bson.Raw(t)
@@ -246,7 +243,10 @@ func (c *Cursor) All(ctx context.Context, results interface{}) error {
 	var index int
 	var err error
 
-	defer c.Close(ctx)
+	// Defer a call to Close to try to clean up the cursor server-side when all
+	// documents have not been exhausted. Use context.Background() to ensure Close
+	// completes even if the context passed to All has errored.
+	defer c.Close(context.Background())
 
 	batch := c.batch // exhaust the current batch before iterating the batch cursor
 	for {

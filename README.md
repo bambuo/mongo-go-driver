@@ -22,8 +22,9 @@ The MongoDB supported driver for Go.
 -------------------------
 ## Requirements
 
-- Go 1.10 or higher if using the driver as a dependency. Go 1.17 or higher if building the driver yourself. We aim to support the latest versions of Go.
-- MongoDB 2.6 and higher.
+- Go 1.13 or higher. We aim to support the latest versions of Go.
+  - Go 1.18 or higher is required to run the driver test suite.
+- MongoDB 3.6 and higher.
 
 -------------------------
 ## Installation
@@ -227,12 +228,17 @@ Ensure the [`--networkMessageCompressors` flag](https://www.mongodb.com/docs/man
 -------------------------
 ## Contribution
 
-Check out the [project page](https://jira.mongodb.org/browse/GODRIVER) for tickets that need completing. See our [contribution guidelines](CONTRIBUTING.md) for details.
+Check out the [project page](https://jira.mongodb.org/browse/GODRIVER) for tickets that need completing. See our [contribution guidelines](docs/CONTRIBUTING.md) for details.
 
 -------------------------
 ## Continuous Integration
 
 Commits to master are run automatically on [evergreen](https://evergreen.mongodb.com/waterfall/mongo-go-driver).
+
+-------------------------
+## Frequently Encountered Issues
+
+See our [common issues](docs/common-issues.md) documentation for troubleshooting frequently encountered issues.
 
 -------------------------
 ## Thanks and Acknowledgement

@@ -17,13 +17,14 @@ import (
 	"testing"
 
 	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/internal/testutil/assert"
+	"go.mongodb.org/mongo-driver/internal/assert"
+	"go.mongodb.org/mongo-driver/internal/testutil/helpers"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/integration/mtest"
 )
 
 const (
-	crudTestsDir = "../../data/crud"
+	crudTestsDir = "../../testdata/crud"
 	crudReadDir  = "v1/read"
 	crudWriteDir = "v1/write"
 )
@@ -111,7 +112,7 @@ func runCrudFile(t *testing.T, file string) {
 
 func runCrudTest(mt *mtest.T, test crudTest, testFile crudTestFile) {
 	if len(testFile.Data) > 0 {
-		docs := rawSliceToInterfaceSlice(testFile.Data)
+		docs := helpers.RawToInterfaces(testFile.Data...)
 		_, err := mt.Coll.InsertMany(context.Background(), docs)
 		assert.Nil(mt, err, "InsertMany error: %v", err)
 	}

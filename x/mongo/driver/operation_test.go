@@ -17,7 +17,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson/bsontype"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/internal"
-	"go.mongodb.org/mongo-driver/internal/testutil/assert"
+	"go.mongodb.org/mongo-driver/internal/assert"
 	"go.mongodb.org/mongo-driver/internal/uuid"
 	"go.mongodb.org/mongo-driver/mongo/address"
 	"go.mongodb.org/mongo-driver/mongo/description"
@@ -207,7 +207,7 @@ func TestOperation(t *testing.T) {
 
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
-				gotWM, gotErr := Operation{}.roundTrip(context.Background(), tc.conn, tc.paramWM)
+				gotWM, _, gotErr := Operation{}.roundTrip(context.Background(), tc.conn, tc.paramWM)
 				if !bytes.Equal(gotWM, tc.wantWM) {
 					t.Errorf("Returned wire messages are not equal. got %v; want %v", gotWM, tc.wantWM)
 				}
@@ -281,6 +281,76 @@ func TestOperation(t *testing.T) {
 				t.Errorf("ClusterTimes do not match. got %v; want %v", got, want)
 			}
 		})
+	})
+	t.Run("calculateMaxTimeMS", func(t *testing.T) {
+		timeout := 5 * time.Second
+		maxTime := 2 * time.Second
+		negMaxTime := -2 * time.Second
+		shortRTT := 50 * time.Millisecond
+		longRTT := 10 * time.Second
+		timeoutCtx, cancel := internal.MakeTimeoutContext(context.Background(), timeout)
+		defer cancel()
+
+		testCases := []struct {
+			name  string
+			op    Operation
+			ctx   context.Context
+			rtt90 time.Duration
+			want  uint64
+			err   error
+		}{
+			{
+				name:  "uses context deadline and rtt90 with timeout",
+				op:    Operation{MaxTime: &maxTime},
+				ctx:   timeoutCtx,
+				rtt90: shortRTT,
+				want:  5000,
+				err:   nil,
+			},
+			{
+				name:  "uses MaxTime without timeout",
+				op:    Operation{MaxTime: &maxTime},
+				ctx:   context.Background(),
+				rtt90: longRTT,
+				want:  2000,
+				err:   nil,
+			},
+			{
+				name:  "errors when remaining timeout is less than rtt90",
+				op:    Operation{MaxTime: &maxTime},
+				ctx:   timeoutCtx,
+				rtt90: timeout,
+				want:  0,
+				err:   ErrDeadlineWouldBeExceeded,
+			},
+			{
+				name:  "errors when MaxTime is negative",
+				op:    Operation{MaxTime: &negMaxTime},
+				ctx:   context.Background(),
+				rtt90: longRTT,
+				want:  0,
+				err:   ErrNegativeMaxTime,
+			},
+		}
+		for _, tc := range testCases {
+			// Capture test-case for parallel sub-test.
+			tc := tc
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				got, err := tc.op.calculateMaxTimeMS(tc.ctx, tc.rtt90, "")
+
+				// Assert that the calculated maxTimeMS is less than or equal to the expected value. A few
+				// milliseconds will have elapsed toward the context deadline, and (remainingTimeout
+				// - rtt90) will be slightly smaller than the expected value.
+				if got > tc.want {
+					t.Errorf("maxTimeMS value higher than expected. got %v; wanted at most %v", got, tc.want)
+				}
+				if !errors.Is(err, tc.err) {
+					t.Errorf("error values do not match. got %v; want %v", err, tc.err)
+				}
+			})
+		}
 	})
 	t.Run("updateClusterTimes", func(t *testing.T) {
 		clustertime := bsoncore.BuildDocumentFromElements(nil,
@@ -550,7 +620,7 @@ func TestOperation(t *testing.T) {
 			conn := &mockConnection{
 				rStreaming: false,
 			}
-			err := Operation{}.ExecuteExhaust(context.TODO(), conn, nil)
+			err := Operation{}.ExecuteExhaust(context.TODO(), conn)
 			assert.NotNil(t, err, "expected error, got nil")
 		})
 	})
@@ -581,7 +651,7 @@ func TestOperation(t *testing.T) {
 			Database:   "admin",
 			Deployment: SingleConnectionDeployment{conn},
 		}
-		err := op.Execute(context.TODO(), nil)
+		err := op.Execute(context.TODO())
 		assert.Nil(t, err, "Execute error: %v", err)
 
 		// The wire message sent to the server should not have exhaustAllowed=true. After execution, the connection
@@ -593,7 +663,7 @@ func TestOperation(t *testing.T) {
 		streamingResponse := createExhaustServerResponse(serverResponseDoc, true)
 		conn.rReadWM = streamingResponse
 		conn.rCanStream = true
-		err = op.Execute(context.TODO(), nil)
+		err = op.Execute(context.TODO())
 		assert.Nil(t, err, "Execute error: %v", err)
 		assertExhaustAllowedSet(t, conn.pWriteWM, true)
 		assert.True(t, conn.CurrentlyStreaming(), "expected CurrentlyStreaming to be true")
@@ -601,9 +671,51 @@ func TestOperation(t *testing.T) {
 		// Reset the server response and go through ExecuteExhaust to mimic streaming the next response. After
 		// execution, the connection should still be in a streaming state.
 		conn.rReadWM = streamingResponse
-		err = op.ExecuteExhaust(context.TODO(), conn, nil)
+		err = op.ExecuteExhaust(context.TODO(), conn)
 		assert.Nil(t, err, "ExecuteExhaust error: %v", err)
 		assert.True(t, conn.CurrentlyStreaming(), "expected CurrentlyStreaming to be true")
+	})
+	t.Run("context deadline exceeded not marked as TransientTransactionError", func(t *testing.T) {
+		conn := new(mockConnection)
+		// Create a context that's already timed out.
+		ctx, cancel := context.WithDeadline(context.Background(), time.Unix(893934480, 0))
+		defer cancel()
+
+		op := Operation{
+			Database:   "foobar",
+			Deployment: SingleConnectionDeployment{C: conn},
+			CommandFn: func(dst []byte, desc description.SelectedServer) ([]byte, error) {
+				dst = bsoncore.AppendInt32Element(dst, "ping", 1)
+				return dst, nil
+			},
+		}
+
+		err := op.Execute(ctx)
+		assert.NotNil(t, err, "expected an error from Execute(), got nil")
+		// Assert that error is just context deadline exceeded and is therefore not a driver.Error marked
+		// with the TransientTransactionError label.
+		assert.Equal(t, err, context.DeadlineExceeded, "expected context.DeadlineExceeded error, got %v", err)
+	})
+	t.Run("canceled context not marked as TransientTransactionError", func(t *testing.T) {
+		conn := new(mockConnection)
+		// Create a context and cancel it immediately.
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		op := Operation{
+			Database:   "foobar",
+			Deployment: SingleConnectionDeployment{C: conn},
+			CommandFn: func(dst []byte, desc description.SelectedServer) ([]byte, error) {
+				dst = bsoncore.AppendInt32Element(dst, "ping", 1)
+				return dst, nil
+			},
+		}
+
+		err := op.Execute(ctx)
+		assert.NotNil(t, err, "expected an error from Execute(), got nil")
+		// Assert that error is just context canceled and is therefore not a driver.Error marked with
+		// the TransientTransactionError label.
+		assert.Equal(t, err, context.Canceled, "expected context.Canceled error, got %v", err)
 	})
 }
 
@@ -724,12 +836,8 @@ func (ms *mockRetryServer) Connection(ctx context.Context) (Connection, error) {
 	return nil, retryableError{error: errors.New("test error")}
 }
 
-func (ms *mockRetryServer) MinRTT() time.Duration {
-	return 0
-}
-
-func (ms *mockRetryServer) RTT90() time.Duration {
-	return 0
+func (ms *mockRetryServer) RTTMonitor() RTTMonitor {
+	return &internal.ZeroRTTMonitor{}
 }
 
 func TestRetry(t *testing.T) {
@@ -748,7 +856,7 @@ func TestRetry(t *testing.T) {
 			Database:   "testing",
 			RetryMode:  &retry,
 			Type:       Read,
-		}.Execute(ctx, nil)
+		}.Execute(ctx)
 		assert.NotNil(t, err, "expected an error from Execute()")
 
 		// Expect Connection() to be called at least 3 times. The first call is the initial attempt

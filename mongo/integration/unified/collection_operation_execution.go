@@ -13,7 +13,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/bsontype"
-	testhelpers "go.mongodb.org/mongo-driver/internal/testutil/helpers"
+	"go.mongodb.org/mongo-driver/internal/testutil/helpers"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
@@ -78,7 +78,7 @@ func executeAggregate(ctx context.Context, operation *operation) (*operationResu
 		case "maxAwaitTimeMS":
 			opts.SetMaxAwaitTime(time.Duration(val.Int32()) * time.Millisecond)
 		case "pipeline":
-			pipeline = testhelpers.RawToInterfaceSlice(val.Array())
+			pipeline = helpers.RawToInterfaces(helpers.RawToDocuments(val.Array())...)
 		case "let":
 			opts.SetLet(val.Document())
 		default:
@@ -808,7 +808,7 @@ func executeFindOneAndUpdate(ctx context.Context, operation *operation) (*operat
 		switch key {
 		case "arrayFilters":
 			opts.SetArrayFilters(options.ArrayFilters{
-				Filters: testhelpers.RawToInterfaceSlice(val.Array()),
+				Filters: helpers.RawToInterfaces(helpers.RawToDocuments(val.Array())...),
 			})
 		case "bypassDocumentValidation":
 			opts.SetBypassDocumentValidation(val.Boolean())
@@ -895,7 +895,7 @@ func executeInsertMany(ctx context.Context, operation *operation) (*operationRes
 		case "comment":
 			opts.SetComment(val)
 		case "documents":
-			documents = testhelpers.RawToInterfaceSlice(val.Array())
+			documents = helpers.RawToInterfaces(helpers.RawToDocuments(val.Array())...)
 		case "ordered":
 			opts.SetOrdered(val.Boolean())
 		default:
@@ -1172,7 +1172,12 @@ type cursorResult struct {
 
 func createFindCursor(ctx context.Context, operation *operation) (*cursorResult, error) {
 	coll, err := entities(ctx).collection(operation.Object)
+	// Find operations can also be run against GridFS buckets. Check for a bucket entity of the
+	// same name and run createBucketFindCursor if an entity is found.
 	if err != nil {
+		if _, bucketOk := entities(ctx).gridFSBucket(operation.Object); bucketOk == nil {
+			return createBucketFindCursor(ctx, operation)
+		}
 		return nil, err
 	}
 

@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
-	"go.mongodb.org/mongo-driver/internal/testutil/assert"
+	"go.mongodb.org/mongo-driver/internal/assert"
+	"go.mongodb.org/mongo-driver/internal/require"
 )
 
 func TestNew(t *testing.T) {
@@ -26,6 +26,20 @@ func TestNew(t *testing.T) {
 func TestString(t *testing.T) {
 	id := NewObjectID()
 	require.Contains(t, id.String(), id.Hex())
+}
+
+func BenchmarkHex(b *testing.B) {
+	id := NewObjectID()
+	for i := 0; i < b.N; i++ {
+		id.Hex()
+	}
+}
+
+func BenchmarkObjectIDFromHex(b *testing.B) {
+	id := NewObjectID().Hex()
+	for i := 0; i < b.N; i++ {
+		_, _ = ObjectIDFromHex(id)
+	}
 }
 
 func TestFromHex_RoundTrip(t *testing.T) {

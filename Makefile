@@ -1,12 +1,3 @@
-# We list packages with shell scripts and loop through them to avoid testing with ./...
-# Running go test ./... will run tests in all packages concurrently which can lead to
-# unexpected errors.
-#
-# TODO(GODRIVER-2093): Use ./... to run tests in all packages with parallelism and remove
-# these PKG variables and loops from all make targets.
-PKGS = $(shell etc/list_pkgs.sh)
-TEST_PKGS = $(shell etc/list_test_pkgs.sh)
-
 ATLAS_URIS = "$(ATLAS_FREE)" "$(ATLAS_REPLSET)" "$(ATLAS_SHARD)" "$(ATLAS_TLS11)" "$(ATLAS_TLS12)" "$(ATLAS_FREE_SRV)" "$(ATLAS_REPLSET_SRV)" "$(ATLAS_SHARD_SRV)" "$(ATLAS_TLS11_SRV)" "$(ATLAS_TLS12_SRV)" "$(ATLAS_SERVERLESS)" "$(ATLAS_SERVERLESS_SRV)"
 GODISTS=linux/amd64 linux/386 linux/arm64 linux/arm linux/s390x
 TEST_TIMEOUT = 1800
@@ -25,29 +16,26 @@ add-license:
 
 .PHONY: build
 build:
-	go build $(BUILD_TAGS) $(PKGS)
+	go build $(BUILD_TAGS) ./...
 
 .PHONY: build-examples
 build-examples:
-	go build $(BUILD_TAGS) ./examples/... ./x/mongo/driver/examples/...
+	go build $(BUILD_TAGS) ./examples/...
 
 .PHONY: build-no-tags
 build-no-tags:
-	go build $(PKGS)
+	go build ./...
 
 .PHONY: build-tests
 build-tests:
-	for TEST in $(TEST_PKGS); do \
-		go test $(BUILD_TAGS) -c $$TEST ; \
-		if [ $$? -ne 0 ]; \
-		then \
-			exit 1; \
-		fi \
-	done
+	# Use ^$ to match no tests so that no tests are actually run but all tests are
+	# compiled. Run with -short to ensure none of the TestMain functions try to
+	# connect to a server.
+	go test -short $(BUILD_TAGS) -run ^$$ ./...
 
 .PHONY: check-fmt
 check-fmt:
-	etc/check_fmt.sh $(PKGS)
+	etc/check_fmt.sh
 
 # check-modules runs "go mod tidy" then "go mod vendor" and exits with a non-zero exit code if there
 # are any module or vendored modules changes. The intent is to confirm two properties:
@@ -69,7 +57,7 @@ doc:
 
 .PHONY: fmt
 fmt:
-	gofmt -l -s -w $(PKGS)
+	go fmt ./...
 
 .PHONY: lint
 lint:
@@ -88,49 +76,41 @@ update-notices:
 ### Local testing targets. ###
 .PHONY: test
 test:
-	for TEST in $(TEST_PKGS) ; do \
-		go test $(BUILD_TAGS) -timeout $(TEST_TIMEOUT)s $$TEST ; \
-	done
+	go test $(BUILD_TAGS) -timeout $(TEST_TIMEOUT)s -p 1 ./...
 
 .PHONY: test-cover
 test-cover:
-	for TEST in $(TEST_PKGS) ; do \
-		go test $(BUILD_TAGS) -timeout $(TEST_TIMEOUT)s -cover $(COVER_ARGS) $$TEST ; \
-	done
+	go test $(BUILD_TAGS) -timeout $(TEST_TIMEOUT)s -cover $(COVER_ARGS) -p 1 ./...
 
 .PHONY: test-race
 test-race:
-	for TEST in $(TEST_PKGS) ; do \
-		go test $(BUILD_TAGS) -timeout $(TEST_TIMEOUT)s -race $$TEST ; \
-	done
+	go test $(BUILD_TAGS) -timeout $(TEST_TIMEOUT)s -race -p 1 ./...
 
 .PHONY: test-short
 test-short:
-	go test $(BUILD_TAGS) -timeout 60s -short $(TEST_PKGS)
+	go test $(BUILD_TAGS) -timeout 60s -short -p 1 ./...
 
 ### Evergreen specific targets. ###
 .PHONY: build-aws-ecs-test
 build-aws-ecs-test:
-	go build $(BUILD_TAGS) ./mongo/testaws/main.go
+	go build $(BUILD_TAGS) ./cmd/testaws/main.go
 
 .PHONY: evg-test
 evg-test:
-	for TEST in $(TEST_PKGS); do \
-		go test -exec "env PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) LD_LIBRARY_PATH=$(LD_LIBRARY_PATH)" $(BUILD_TAGS) -v -timeout $(TEST_TIMEOUT)s $$TEST >> test.suite ; \
-	done
+	go test -exec "env PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) LD_LIBRARY_PATH=$(LD_LIBRARY_PATH)" $(BUILD_TAGS) -v -timeout $(TEST_TIMEOUT)s -p 1 ./... >> test.suite
 
 .PHONY: evg-test-atlas
 evg-test-atlas:
-	go run ./mongo/testatlas/main.go $(ATLAS_URIS)
+	go run ./cmd/testatlas/main.go $(ATLAS_URIS)
 
 .PHONY: evg-test-atlas-data-lake
 evg-test-atlas-data-lake:
 	ATLAS_DATA_LAKE_INTEGRATION_TEST=true go test -v ./mongo/integration -run TestUnifiedSpecs/atlas-data-lake-testing >> spec_test.suite
 	ATLAS_DATA_LAKE_INTEGRATION_TEST=true go test -v ./mongo/integration -run TestAtlasDataLake >> spec_test.suite
 
-.PHONY: evg-test-auth
-evg-test-auth:
-	go run -tags gssapi ./x/mongo/driver/examples/count/main.go -uri $(MONGODB_URI)
+.PHONY: evg-test-enterprise-auth
+evg-test-enterprise-auth:
+	go run -tags gssapi ./cmd/testentauth/main.go
 
 .PHONY: evg-test-kmip
 evg-test-kmip:
@@ -180,6 +160,8 @@ evg-test-serverless:
 	go test $(BUILD_TAGS) ./mongo/integration -run TestConvenientTransactions -v -timeout $(TEST_TIMEOUT)s >> test.suite
 	go test $(BUILD_TAGS) ./mongo/integration -run TestCursor -v -timeout $(TEST_TIMEOUT)s >> test.suite
 	go test $(BUILD_TAGS) ./mongo/integration/unified -run TestUnifiedSpec -v -timeout $(TEST_TIMEOUT)s >> test.suite
+	go test -exec "env PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) LD_LIBRARY_PATH=$(LD_LIBRARY_PATH)" $(BUILD_TAGS) -v -timeout $(TEST_TIMEOUT)s ./mongo/integration -run TestClientSideEncryptionSpec >> test.suite
+	go test -exec "env PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) LD_LIBRARY_PATH=$(LD_LIBRARY_PATH)" $(BUILD_TAGS) -v -timeout $(TEST_TIMEOUT)s ./mongo/integration -run TestClientSideEncryptionProse >> test.suite
 
 .PHONY: evg-test-versioned-api
 evg-test-versioned-api:
@@ -187,6 +169,14 @@ evg-test-versioned-api:
 	for TEST_PKG in ./mongo ./mongo/integration ./mongo/integration/unified; do \
 		go test -exec "env PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) LD_LIBRARY_PATH=$(LD_LIBRARY_PATH)" $(BUILD_TAGS) -v -timeout $(TEST_TIMEOUT)s $$TEST_PKG >> test.suite ; \
 	done
+
+.PHONY: build-gcpkms-test
+build-gcpkms-test:
+	go build $(BUILD_TAGS) ./cmd/testgcpkms
+
+.PHONY: build-awskms-test
+build-awskms-test:
+	go build $(BUILD_TAGS) ./cmd/testawskms
 
 ### Benchmark specific targets and support. ###
 .PHONY: benchmark
@@ -198,7 +188,8 @@ driver-benchmark:perf
 	@go run cmd/godriver-benchmark/main.go | tee perf.suite
 
 perf:driver-test-data.tar.gz
-	tar -zxf $< $(if $(eq $(UNAME_S),Darwin),-s , --transform=s)/data/perf/
+	tar -zxf $< $(if $(eq $(UNAME_S),Darwin),-s , --transform=s)/testdata/perf/
 	@touch $@
+
 driver-test-data.tar.gz:
 	curl --retry 5 "https://s3.amazonaws.com/boxes.10gen.com/build/driver-test-data.tar.gz" -o driver-test-data.tar.gz --silent --max-time 120

@@ -12,11 +12,14 @@ import (
 	"io"
 	"math"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
+	"go.mongodb.org/mongo-driver/internal/assert"
+	"go.mongodb.org/mongo-driver/internal/require"
+	"go.mongodb.org/mongo-driver/mongo/address"
 	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
 	"go.mongodb.org/mongo-driver/x/mongo/driver"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/drivertest"
@@ -100,25 +103,25 @@ func TestRTTMonitor(t *testing.T) {
 
 		assert.Eventuallyf(
 			t,
-			func() bool { return rtt.getRTT() > 0 && rtt.getMinRTT() > 0 && rtt.getRTT90() > 0 },
+			func() bool { return rtt.EWMA() > 0 && rtt.Min() > 0 && rtt.P90() > 0 },
 			1*time.Second,
 			10*time.Millisecond,
-			"expected getRTT(), getMinRTT() and getRTT90() to return positive durations within 1 second")
+			"expected EWMA(), Min() and P90() to return positive durations within 1 second")
 		assert.True(
 			t,
-			rtt.getRTT() > 0,
-			"expected getRTT() to return a positive duration, got %v",
-			rtt.getRTT())
+			rtt.EWMA() > 0,
+			"expected EWMA() to return a positive duration, got %v",
+			rtt.EWMA())
 		assert.True(
 			t,
-			rtt.getMinRTT() > 0,
-			"expected getMinRTT() to return a positive duration, got %v",
-			rtt.getMinRTT())
+			rtt.Min() > 0,
+			"expected Min() to return a positive duration, got %v",
+			rtt.Min())
 		assert.True(
 			t,
-			rtt.getRTT90() > 0,
-			"expected getRTT90() to return a positive duration, got %v",
-			rtt.getRTT90())
+			rtt.P90() > 0,
+			"expected P90() to return a positive duration, got %v",
+			rtt.P90())
 	})
 
 	t.Run("creates the correct size samples slice", func(t *testing.T) {
@@ -200,24 +203,128 @@ func TestRTTMonitor(t *testing.T) {
 		for i := 0; i < 3; i++ {
 			assert.Eventuallyf(
 				t,
-				func() bool { return rtt.getRTT() > 0 },
+				func() bool { return rtt.EWMA() > 0 },
 				1*time.Second,
 				10*time.Millisecond,
-				"expected getRTT() to return a positive duration within 1 second")
+				"expected EWMA() to return a positive duration within 1 second")
 			assert.Eventuallyf(
 				t,
-				func() bool { return rtt.getMinRTT() > 0 },
+				func() bool { return rtt.Min() > 0 },
 				1*time.Second,
 				10*time.Millisecond,
-				"expected getMinRTT() to return a positive duration within 1 second")
+				"expected Min() to return a positive duration within 1 second")
 			assert.Eventuallyf(
 				t,
-				func() bool { return rtt.getRTT90() > 0 },
+				func() bool { return rtt.P90() > 0 },
 				1*time.Second,
 				10*time.Millisecond,
-				"expected getRTT90() to return a positive duration within 1 second")
+				"expected P90() to return a positive duration within 1 second")
 			rtt.reset()
 		}
+	})
+
+	// GODRIVER-2464
+	// Test that the RTT monitor can continue monitoring server RTTs after an operation gets stuck.
+	// An operation can get stuck if the server or a proxy stops responding to requests on the RTT
+	// connection but does not close the TCP socket, effectively creating an operation that will
+	// never complete.
+	t.Run("stuck operations time out", func(t *testing.T) {
+		t.Parallel()
+
+		// Start a goroutine that listens for and accepts TCP connections, reads requests, and
+		// responds with {"ok": 1}. The first 2 connections simulate "stuck" connections and never
+		// respond or close.
+		l, err := net.Listen("tcp", "localhost:0")
+		require.NoError(t, err)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			for i := 0; ; i++ {
+				conn, err := l.Accept()
+				if err != nil {
+					// The listen loop is cancelled by closing the listener, so there will always be
+					// an error here. Log the error to make debugging easier in case of unexpected
+					// errors.
+					t.Logf("Accept error: %v", err)
+					return
+				}
+
+				// Only close connections when the listener loop returns to prevent closing "stuck"
+				// connections while the test is running.
+				defer conn.Close()
+
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+
+					buf := make([]byte, 256)
+					for {
+						if _, err := conn.Read(buf); err != nil {
+							// The connection read/write loop is cancelled by closing the connection,
+							// so may be an expected error here. Log the error to make debugging
+							// easier in case of unexpected errors.
+							t.Logf("Read error: %v", err)
+							return
+						}
+
+						// For the first 2 connections, read the request but never respond and don't
+						// close the connection. That simulates the behavior of a "stuck" connection.
+						if i < 2 {
+							return
+						}
+
+						// Delay for 10ms so that systems with limited timing granularity (e.g. some
+						// older versions of Windows) can measure a non-zero latency.
+						time.Sleep(10 * time.Millisecond)
+
+						if _, err := conn.Write(makeHelloReply()); err != nil {
+							// The connection read/write loop is cancelled by closing the connection,
+							// so may be an expected error here. Log the error to make debugging
+							// easier in case of unexpected errors.
+							t.Logf("Write error: %v", err)
+							return
+						}
+					}
+				}(i)
+			}
+		}()
+
+		rtt := newRTTMonitor(&rttConfig{
+			interval: 10 * time.Millisecond,
+			timeout:  100 * time.Millisecond,
+			createConnectionFn: func() *connection {
+				return newConnection(address.Address(l.Addr().String()))
+			},
+			createOperationFn: func(conn driver.Connection) *operation.Hello {
+				return operation.NewHello().Deployment(driver.SingleConnectionDeployment{C: conn})
+			},
+		})
+		rtt.connect()
+
+		assert.Eventuallyf(
+			t,
+			func() bool { return rtt.EWMA() > 0 },
+			1*time.Second,
+			10*time.Millisecond,
+			"expected EWMA() to return a positive duration within 1 second")
+		assert.Eventuallyf(
+			t,
+			func() bool { return rtt.Min() > 0 },
+			1*time.Second,
+			10*time.Millisecond,
+			"expected Min() to return a positive duration within 1 second")
+		assert.Eventuallyf(
+			t,
+			func() bool { return rtt.P90() > 0 },
+			1*time.Second,
+			10*time.Millisecond,
+			"expected P90() to return a positive duration within 1 second")
+
+		rtt.disconnect()
+		l.Close()
+		wg.Wait()
 	})
 }
 

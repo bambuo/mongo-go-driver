@@ -21,11 +21,12 @@ var (
 		"transactions/unified",
 		"load-balancers",
 		"collection-management",
-		"command-monitoring/unified",
+		"command-monitoring",
 		"sessions",
 		"retryable-writes/unified",
 		"client-side-encryption/unified",
 		"client-side-operations-timeout",
+		"gridfs",
 	}
 	failDirectories = []string{
 		"unified-test-format/valid-fail",
@@ -33,7 +34,7 @@ var (
 )
 
 const (
-	dataDirectory = "../../../data"
+	dataDirectory = "../../../testdata"
 )
 
 func TestUnifiedSpec(t *testing.T) {

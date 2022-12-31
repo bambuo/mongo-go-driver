@@ -17,16 +17,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/internal"
-	"go.mongodb.org/mongo-driver/internal/testutil/assert"
-	testhelpers "go.mongodb.org/mongo-driver/internal/testutil/helpers"
+	"go.mongodb.org/mongo-driver/internal/assert"
+	"go.mongodb.org/mongo-driver/internal/require"
+	"go.mongodb.org/mongo-driver/internal/testutil/helpers"
 	"go.mongodb.org/mongo-driver/mongo/address"
 	"go.mongodb.org/mongo-driver/mongo/description"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 	"go.mongodb.org/mongo-driver/x/mongo/driver"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/connstring"
 )
 
 const testTimeout = 2 * time.Second
@@ -71,7 +71,7 @@ func TestServerSelection(t *testing.T) {
 	}
 
 	t.Run("Success", func(t *testing.T) {
-		topo, err := New()
+		topo, err := New(nil)
 		noerr(t, err)
 		desc := description.Topology{
 			Servers: []description.Server{
@@ -94,7 +94,7 @@ func TestServerSelection(t *testing.T) {
 		}
 	})
 	t.Run("Compatibility Error Min Version Too High", func(t *testing.T) {
-		topo, err := New()
+		topo, err := New(nil)
 		noerr(t, err)
 		desc := description.Topology{
 			Kind: description.Single,
@@ -117,7 +117,7 @@ func TestServerSelection(t *testing.T) {
 		assert.Equal(t, err, want, "expected %v, got %v", want, err)
 	})
 	t.Run("Compatibility Error Max Version Too Low", func(t *testing.T) {
-		topo, err := New()
+		topo, err := New(nil)
 		noerr(t, err)
 		desc := description.Topology{
 			Kind: description.Single,
@@ -129,11 +129,9 @@ func TestServerSelection(t *testing.T) {
 		}
 		want := fmt.Errorf(
 			"server at %s reports wire version %d, but this version of the Go driver requires "+
-				"at least %d (MongoDB %s)",
+				"at least 6 (MongoDB 3.6)",
 			desc.Servers[0].Addr.String(),
 			desc.Servers[0].WireVersion.Max,
-			SupportedWireVersions.Min,
-			MinSupportedMongoDBVersion,
 		)
 		desc.CompatibilityErr = want
 		atomic.StoreInt64(&topo.state, topologyConnected)
@@ -142,7 +140,7 @@ func TestServerSelection(t *testing.T) {
 		assert.Equal(t, err, want, "expected %v, got %v", want, err)
 	})
 	t.Run("Updated", func(t *testing.T) {
-		topo, err := New()
+		topo, err := New(nil)
 		noerr(t, err)
 		desc := description.Topology{Servers: []description.Server{}}
 		subCh := make(chan description.Topology, 1)
@@ -191,7 +189,7 @@ func TestServerSelection(t *testing.T) {
 				{Addr: address.Address("three"), Kind: description.Standalone},
 			},
 		}
-		topo, err := New()
+		topo, err := New(nil)
 		noerr(t, err)
 		subCh := make(chan description.Topology, 1)
 		subCh <- desc
@@ -228,7 +226,7 @@ func TestServerSelection(t *testing.T) {
 				{Addr: address.Address("three"), Kind: description.Standalone},
 			},
 		}
-		topo, err := New()
+		topo, err := New(nil)
 		noerr(t, err)
 		subCh := make(chan description.Topology, 1)
 		subCh <- desc
@@ -264,7 +262,7 @@ func TestServerSelection(t *testing.T) {
 				{Addr: address.Address("three"), Kind: description.Standalone},
 			},
 		}
-		topo, err := New()
+		topo, err := New(nil)
 		noerr(t, err)
 		subCh := make(chan description.Topology, 1)
 		subCh <- desc
@@ -287,7 +285,7 @@ func TestServerSelection(t *testing.T) {
 		}
 	})
 	t.Run("findServer returns topology kind", func(t *testing.T) {
-		topo, err := New()
+		topo, err := New(nil)
 		noerr(t, err)
 		atomic.StoreInt64(&topo.state, topologyConnected)
 		srvr, err := ConnectServer(address.Address("one"), topo.updateCallback, topo.id)
@@ -306,9 +304,8 @@ func TestServerSelection(t *testing.T) {
 		}
 	})
 	t.Run("Update on not primary error", func(t *testing.T) {
-		topo, err := New()
+		topo, err := New(nil)
 		noerr(t, err)
-		topo.cfg.cs.HeartbeatInterval = time.Minute
 		atomic.StoreInt64(&topo.state, topologyConnected)
 
 		addr1 := address.Address("one")
@@ -373,9 +370,8 @@ func TestServerSelection(t *testing.T) {
 	})
 	t.Run("fast path does not subscribe or check timeouts", func(t *testing.T) {
 		// Assert that the server selection fast path does not create a Subscription or check for timeout errors.
-		topo, err := New()
+		topo, err := New(nil)
 		noerr(t, err)
-		topo.cfg.cs.HeartbeatInterval = time.Minute
 		atomic.StoreInt64(&topo.state, topologyConnected)
 
 		primaryAddr := address.Address("one")
@@ -402,10 +398,9 @@ func TestServerSelection(t *testing.T) {
 		assert.Equal(t, primaryAddr, selectedAddr, "expected address %v, got %v", primaryAddr, selectedAddr)
 	})
 	t.Run("default to selecting from subscription if fast path fails", func(t *testing.T) {
-		topo, err := New()
+		topo, err := New(nil)
 		noerr(t, err)
 
-		topo.cfg.cs.HeartbeatInterval = time.Minute
 		atomic.StoreInt64(&topo.state, topologyConnected)
 		desc := description.Topology{
 			Servers: []description.Server{},
@@ -420,7 +415,7 @@ func TestServerSelection(t *testing.T) {
 
 func TestSessionTimeout(t *testing.T) {
 	t.Run("UpdateSessionTimeout", func(t *testing.T) {
-		topo, err := New()
+		topo, err := New(nil)
 		noerr(t, err)
 		topo.servers["foo"] = nil
 		topo.fsm.Servers = []description.Server{
@@ -443,7 +438,7 @@ func TestSessionTimeout(t *testing.T) {
 		}
 	})
 	t.Run("MultipleUpdates", func(t *testing.T) {
-		topo, err := New()
+		topo, err := New(nil)
 		noerr(t, err)
 		topo.fsm.Kind = description.ReplicaSetWithPrimary
 		topo.servers["foo"] = nil
@@ -478,7 +473,7 @@ func TestSessionTimeout(t *testing.T) {
 		}
 	})
 	t.Run("NoUpdate", func(t *testing.T) {
-		topo, err := New()
+		topo, err := New(nil)
 		noerr(t, err)
 		topo.servers["foo"] = nil
 		topo.servers["bar"] = nil
@@ -512,7 +507,7 @@ func TestSessionTimeout(t *testing.T) {
 		}
 	})
 	t.Run("TimeoutDataBearing", func(t *testing.T) {
-		topo, err := New()
+		topo, err := New(nil)
 		noerr(t, err)
 		topo.servers["foo"] = nil
 		topo.servers["bar"] = nil
@@ -546,7 +541,7 @@ func TestSessionTimeout(t *testing.T) {
 		}
 	})
 	t.Run("MixedSessionSupport", func(t *testing.T) {
-		topo, err := New()
+		topo, err := New(nil)
 		noerr(t, err)
 		topo.fsm.Kind = description.ReplicaSetWithPrimary
 		topo.servers["one"] = nil
@@ -573,12 +568,12 @@ func TestSessionTimeout(t *testing.T) {
 }
 
 func TestMinPoolSize(t *testing.T) {
-	connStr := connstring.ConnString{
-		Hosts:          []string{"localhost:27017"},
-		MinPoolSize:    10,
-		MinPoolSizeSet: true,
+	cfg, err := NewConfig(options.Client().SetHosts([]string{"localhost:27017"}).SetMinPoolSize(10), nil)
+	if err != nil {
+		t.Errorf("error constructing topology config: %v", err)
 	}
-	topo, err := New(WithConnString(func(connstring.ConnString) connstring.ConnString { return connStr }))
+
+	topo, err := New(cfg)
 	if err != nil {
 		t.Errorf("topology.New shouldn't error. got: %v", err)
 	}
@@ -620,16 +615,16 @@ func TestTopologyConstruction(t *testing.T) {
 			pollingRequired bool
 		}{
 			{"normal", "mongodb://localhost:27017", false},
-			{"srv", "mongodb+srv://localhost:27017", true},
 		}
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
-				topo, err := New(
-					WithURI(func(string) string { return tc.uri }),
-				)
+				cfg, err := NewConfig(options.Client().ApplyURI(tc.uri), nil)
+				assert.Nil(t, err, "error constructing topology config: %v", err)
+
+				topo, err := New(cfg)
 				assert.Nil(t, err, "topology.New error: %v", err)
 
-				assert.Equal(t, tc.uri, topo.cfg.uri, "expected topology URI to be %v, got %v", tc.uri, topo.cfg.uri)
+				assert.Equal(t, tc.uri, topo.cfg.URI, "expected topology URI to be %v, got %v", tc.uri, topo.cfg.URI)
 				assert.Equal(t, tc.pollingRequired, topo.pollingRequired,
 					"expected topo.pollingRequired to be %v, got %v", tc.pollingRequired, topo.pollingRequired)
 			})
@@ -673,9 +668,9 @@ type inWindowTestCase struct {
 // can't be effectively accomplished just with server descriptions like most other server selection
 // algorithms.
 func TestServerSelectionSpecInWindow(t *testing.T) {
-	const testsDir = "../../../../data/server-selection/in_window"
+	const testsDir = "../../../../testdata/server-selection/in_window"
 
-	files := testhelpers.FindJSONFilesInDir(t, testsDir)
+	files := helpers.FindJSONFilesInDir(t, testsDir)
 
 	for _, file := range files {
 		t.Run(file, func(t *testing.T) {
@@ -727,7 +722,7 @@ func runInWindowTest(t *testing.T, directory string, filename string) {
 	// Create a new Topology, set the state to "connected", store a topology description
 	// containing all server descriptions created from the test server descriptions, and copy
 	// all *Server instances to the Topology's servers list.
-	topology, err := New()
+	topology, err := New(nil)
 	require.NoError(t, err, "error creating new Topology")
 	topology.state = topologyConnected
 	topology.desc.Store(description.Topology{
@@ -839,4 +834,69 @@ func serverKindFromString(t *testing.T, s string) description.ServerKind {
 	}
 
 	return description.Unknown
+}
+
+func BenchmarkSelectServerFromDescription(b *testing.B) {
+	for _, bcase := range []struct {
+		name        string
+		serversHook func(servers []description.Server)
+	}{
+		{
+			name:        "AllFit",
+			serversHook: func(servers []description.Server) {},
+		},
+		{
+			name: "AllButOneFit",
+			serversHook: func(servers []description.Server) {
+				servers[0].Kind = description.Unknown
+			},
+		},
+		{
+			name: "HalfFit",
+			serversHook: func(servers []description.Server) {
+				for i := 0; i < len(servers); i += 2 {
+					servers[i].Kind = description.Unknown
+				}
+			},
+		},
+		{
+			name: "OneFit",
+			serversHook: func(servers []description.Server) {
+				for i := 1; i < len(servers); i++ {
+					servers[i].Kind = description.Unknown
+				}
+			},
+		},
+	} {
+		bcase := bcase
+
+		b.Run(bcase.name, func(b *testing.B) {
+			s := description.Server{
+				Addr:              address.Address("localhost:27017"),
+				HeartbeatInterval: time.Duration(10) * time.Second,
+				LastWriteTime:     time.Date(2017, 2, 11, 14, 0, 0, 0, time.UTC),
+				LastUpdateTime:    time.Date(2017, 2, 11, 14, 0, 2, 0, time.UTC),
+				Kind:              description.Mongos,
+				WireVersion:       &description.VersionRange{Min: 0, Max: 5},
+			}
+			servers := make([]description.Server, 100)
+			for i := 0; i < len(servers); i++ {
+				servers[i] = s
+			}
+			bcase.serversHook(servers)
+			desc := description.Topology{
+				Servers: servers,
+			}
+
+			timeout := make(chan time.Time)
+			b.ResetTimer()
+			b.RunParallel(func(p *testing.PB) {
+				b.ReportAllocs()
+				for p.Next() {
+					var c Topology
+					_, _ = c.selectServerFromDescription(desc, newServerSelectionState(selectNone, timeout))
+				}
+			})
+		})
+	}
 }
